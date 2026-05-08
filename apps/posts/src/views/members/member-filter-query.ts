@@ -6,6 +6,12 @@ import type {FilterPredicate, ParsedPredicate} from '../filters/filter-types';
 type CompoundMatcher = (node: AstNode) => ParsedPredicate | null;
 const TIMEZONE_SENSITIVE_MEMBER_FIELDS = getFieldKeysByType(memberFields, 'date');
 
+function isOperatorAllowedForField(field: string, operator: string): boolean {
+    const definition = memberFields[field as keyof typeof memberFields];
+
+    return Boolean(definition && (definition.operators as readonly string[]).includes(operator));
+}
+
 function getCompoundChildren(node: AstNode): {operator: '$and' | '$or'; children: AstNode[]} | null {
     if (Array.isArray(node.$and)) {
         return {operator: '$and', children: node.$and as AstNode[]};
@@ -193,13 +199,25 @@ function parseMemberNode(node: AstNode, timezone: string): ParsedPredicate[] {
 }
 
 export function parseMemberFilter(filter: string | undefined, timezone: string): FilterPredicate[] {
-    const ast = parseFilterToAst(filter ?? '');
+    const ast = parseFilterToAst(filter ?? '', {preserveRelativeDates: true});
 
     if (!ast) {
         return [];
     }
 
-    return stampPredicates(parseMemberNode(ast, timezone));
+    // Drop relative-date predicates whose field doesn't actually advertise
+    // the operator (e.g. `created_at:<=now+7d` — past-only field, future
+    // operator). Round-tripping these would expose UI states the user can't
+    // reach through normal interaction.
+    const predicates = parseMemberNode(ast, timezone).filter((predicate) => {
+        if (predicate.operator !== 'in-the-last' && predicate.operator !== 'in-the-next') {
+            return true;
+        }
+
+        return isOperatorAllowedForField(predicate.field, predicate.operator);
+    });
+
+    return stampPredicates(predicates);
 }
 
 export function hasTimezoneSensitiveMemberFilter(filter: string | undefined): boolean {

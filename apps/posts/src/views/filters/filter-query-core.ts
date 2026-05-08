@@ -3,13 +3,17 @@ import {resolveField} from './resolve-field';
 import type {AstNode} from './filter-ast';
 import type {FilterField, FilterPredicate, ParsedPredicate} from './filter-types';
 
-export function parseFilterToAst(filter: string): AstNode | undefined {
+export interface ParseFilterOptions {
+    preserveRelativeDates?: boolean;
+}
+
+export function parseFilterToAst(filter: string, options: ParseFilterOptions = {}): AstNode | undefined {
     if (!filter) {
         return undefined;
     }
 
     try {
-        return nql.parse(filter) as AstNode;
+        return nql.parse(filter, options) as AstNode;
     } catch {
         return undefined;
     }
