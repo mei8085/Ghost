@@ -748,9 +748,10 @@ const deleteSession = async function deleteSession(req, res) {
 │  ┌─────────────────────────────────────────────────────────────┐     │
 │  │  Members API 层 (状态操作层)                            │     │
 │  │                                                       │     │
-│  │  GET  /members/api/member/  ← 查身份（验证 Cookie）     │     │
-│  │  PUT  /members/api/member/  ← 编辑资料                  │     │
-│  │  POST /members/api/signout/ ← 清除会话 Cookie         │     │
+│  │  GET    /members/api/member/    ← 查身份（验证 Cookie） │     │
+│  │  PUT    /members/api/member/    ← 编辑资料              │     │
+│  │  DELETE /members/api/session/   ← 清除会话 Cookie      │     │
+│  │  GET    /members/api/session/   ← 获取身份 JWT         │     │
 │  │                                                       │     │
 │  │  ✓ 是状态唯一可信来源                                 │     │
 │  └─────────────────────────────────────────────────────────────┘     │
@@ -1159,54 +1160,53 @@ window.addEventListener('hashchange', this.hashHandler, false);
 #### 6.6.5 后台预览实时同步时序
 
 ```
-后台预览 iframe 中实时同步：
+后台预览 iframe 实时同步流程：
 
 T0: Admin 后台加载 Portal 设置页面
     │
     ▼
-    PortalPreview 组件渲染
+    PortalModal 组件渲染
     ├── getPortalPreviewUrl({settings: localSettings, ...})
-    │   用当前本地表单值构建 URL
+    │   用当前本地表单值构建预览 URL
     │
     └── PortalFrame <iframe src={href}/> 加载
 
-T1: 用户修改 accent_color 输入框
+T1: 用户在后台表单修改 accent_color
     │
     ▼
-    updateSetting('accent_color', '#FF5733')
-    ├── localSettings 本地 React state 更新
+    localSettings (React state) 更新
     │
     └── 组件重新渲染
         │
         └── getPortalPreviewUrl() 重新计算
             │
-            └── 新 href = "...&accentColor=%23FF5733
+            └── 新 href = "...&accentColor=%23FF5733"
             │
-            └── PortalFrame src 变更 → iframe 重新加载？
+            └── PortalFrame src 变更
             │
-            ▼
-            注意：React 默认 iframe src 变化通常会重新加载 iframe
-            但 PortalFrame 未强制 reload 实现更智能
-            
-T2: iframe 重新加载（或 hashchange 事件）
+            └── iframe 重新加载整个页面
+
+T2: iframe 重新加载（完整页面重载）
     │
     ▼
-    站点页面重新加载 / hash 变化
+    站点页面重新加载（完整 HTML + Portal 重新初始化）
     │
     └── Portal init()
-        ├── isNormalPreviewMode() → true
+        ├── isNormalPreviewMode() → true（hash 路径为 #/portal/preview）
         │
-        ├── fetchPreviewData() 解析新 accentColor
+        ├── fetchPreviewData() 解析 hash query 中的 accentColor
         │
-        └── updateStateForPreviewLinks() → setState → ✓ 实时显示新颜色
+        └── updateStateForPreviewLinks() → setState
+        │
+        └── ✓ 显示新颜色（iframe 已重载）
 ```
 
-**预览模式与生产模式对比：
+**预览模式与生产模式对比**：
 
 | 维度 | 预览模式（后台） | 生产模式（访客） |
 |------|-----------------|-----------------|
 | 设置传递方式 | URL hash 参数 | data-* 属性 + Content API |
-| 已打开页面实时同步？ | ✓ 是（hashchange 或 iframe 重载） | ❌ 否 |
+| 已打开页面实时同步？ | ✓ 是（iframe 重载） | ❌ 否 |
 | 数据来源优先级 | hash 参数 > API | API + data-* |
 | 触发实时 | 修改即生效 | 需刷新页面 |
 | 持久化到数据库？ | ❌ 否（本地表单 state） | ✓ 是（保存时） |
