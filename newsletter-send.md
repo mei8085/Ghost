@@ -497,43 +497,83 @@ const mailgunOptions = {
 };
 ```
 
-#### 5.2.3 第三层：事件 ID 去重
+#### 5.2.3 事件 ID 的真实使用：仅失败记录写入，未用于去重
 
-虽然 Mailgun API 的分页机制本身避免重复，但 Ghost 通过**时间游标**实现额外的去重保证：
+**代码对账结论**：Ghost **没有**使用 `event.id` 做去重（如 `ON CONFLICT(event_id) DO NOTHING` 或存储已处理 event.id 的表）。
+
+`event.id` 的唯一用途是写入 `email_recipient_failures.event_id` 字段：
 
 ```javascript
-// email-analytics-service.js:141-157
-async getLastNonOpenedEventTimestamp() {
-    return this.#fetchLatestNonOpenedData?.lastEventTimestamp 
-        ?? (await this.queries.getLastEventTimestamp(
-            this.#fetchLatestNonOpenedData.jobName,
-            ['delivered','failed']
-        )) 
-        ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
+// email-event-storage.js:153
+event_id: event.id
+
+// email-event-storage.js:173
+event_id: event.id
+```
+
+**去重依赖的真实机制**：
+
+| 机制 | 实现方式 | 代码位置 |
+|------|----------|----------|
+| **时间游标** | `[lastEventTimestamp, end]` 窗口轮询，游标前进 | `queries.getLastEventTimestamp()` → `jobs.finished_at` |
+| **WHERE IS NULL** | 只更新 NULL 字段，幂等写入 | `email-event-storage.js:54, 80, 106` |
+| **事件时间戳比较** | 取最早时间戳，忽略更晚的重复事件 | `email-event-storage.js:45, 71, 97` |
+
+**时间游标机制详解**：
+
+```javascript
+// queries.js:40-78
+async getLastEventTimestamp(jobName, events = ['delivered', 'opened', 'failed']) {
+    // 优先级：jobs.finished_at > jobs.started_at > 各字段 MAX()
+    const lastJobRunTimestamp = await this.getLastJobRunTimestamp(jobName);
+
+    if (lastJobRunTimestamp) {
+        // 优先使用 jobs 表记录的游标
+        maxOpenedAt = events.includes('opened') ? lastJobRunTimestamp : null;
+        maxDeliveredAt = events.includes('delivered') ? lastJobRunTimestamp : null;
+        maxFailedAt = events.includes('failed') ? lastJobRunTimestamp : null;
+    } else {
+        // 首次运行 fallback：查询各字段最大值
+        maxOpenedAt = MAX(email_recipients.opened_at);
+        maxDeliveredAt = MAX(email_recipients.delivered_at);
+        maxFailedAt = MAX(email_recipients.failed_at);
+    }
+
+    return _.max([maxOpenedAt, maxDeliveredAt, maxFailedAt]);
 }
 
-// email-analytics-service.js:497-506
-// 消费完当前窗口后，游标前进 1 秒
-if (!error && eventCount > 0 && fetchData.lastEventTimestamp 
-    && fetchData.lastEventTimestamp.getTime() < Date.now() - 2000) {
-    
-    await this.queries.setJobTimestamp(
-        fetchData.jobName, 
-        'finished', 
-        new Date(fetchData.lastEventTimestamp.getTime())
-    );
-    
-    if (eventCount < maxEvents) {
-        // 全部消费完才前进 1 秒，避免秒级边界事件遗漏
-        fetchData.lastEventTimestamp = new Date(fetchData.lastEventTimestamp.getTime() + 1000);
-    }
+// queries.js:109-128
+async setJobTimestamp(jobName, field, date) {
+    // 更新 jobs 表游标
+    await db.knex('jobs')
+        .update({[updateField]: date, status: status})
+        .where('name', jobName);
 }
 ```
 
-**去重保障**：
-- 每次拉取从上一次的 `lastEventTimestamp` 开始
-- 只有完整消费完当前秒的所有事件后，游标才前进 1 秒
-- `jobs` 表持久化游标，服务重启后可续传
+**时间游标前进逻辑**：
+```
+[lastEventTs] ────────────────▶ [end = now - 1min]
+                    │
+                    ▼
+      拉取此时间窗口内的所有事件
+                    │
+                    ▼
+        事件消费完？
+            │
+            ├── 是 ──▶ 游标前进 = lastEventTs + 1 秒（或到处理的最大事件时间）
+            └── 否 ──▶ 游标不前进，下次继续处理同窗口
+```
+
+**可能的重复处理边界**：
+
+| 场景 | 重复风险 | 保护机制 |
+|------|----------|----------|
+| 同一秒内的事件跨 job 边界 | **可能重复拉取** | `WHERE xxx_at IS NULL` |
+| `fetchLatest` 和 `fetchMissing` 时间窗口重叠 | **同事件被两个 job 拉取** | `WHERE xxx_at IS NULL` |
+| job 中途崩溃，游标未前进 | **整个窗口重新处理** | `WHERE xxx_at IS NULL` |
+
+**结论**：事件去重完全依赖**幂等写入**（`WHERE IS NULL` + 时间戳比较），而非 event.id 级别去重。
 
 #### 5.2.4 第四层：事件关联校验
 
