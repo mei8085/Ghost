@@ -734,6 +734,236 @@ const getEventType = (originalStatus, updatedStatus) => {
   4. 对于订阅场景：此事件通常伴随 subscription.updated
 ```
 
+**事件 6: customer.subscription.created**
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.created"
+  正常: 日志存在
+  异常:
+    - 找不到日志 → webhook 未到达
+    - "No member found for Stripe customer" → 会员未关联（可能是新会员，checkout 事件还未到）
+    - "ConflictError" → 重复事件
+
+数据库核对:
+  1. SELECT * FROM members_stripe_webhook_events 
+     WHERE type = 'customer.subscription.created'
+     ORDER BY created_at DESC LIMIT 1;
+  2. SELECT id, status, stripe_subscription_id, stripe_price_id, stripe_plan_id
+     FROM members_stripe_customers_subscriptions
+     WHERE stripe_subscription_id = '{subscription_id}';
+     → 期望: 存在新记录
+  3. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE subscription_id = (SELECT id FROM members_stripe_customers_subscriptions 
+                             WHERE stripe_subscription_id = '{subscription_id}')
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'created'
+  4. SELECT id, email, status FROM members 
+     WHERE id = (SELECT member_id FROM members_stripe_customers_subscriptions 
+                  WHERE stripe_subscription_id = '{subscription_id}');
+     → 期望: 存在会员记录
+
+前端验证 (Portal):
+  ❌ 无直接反馈
+  ⚠️ 注意：此事件通常在 checkout.session.completed 之后或同时到达
+  ⚠️ 如果会员已登录，刷新页面后应能看到订阅状态
+
+前端验证 (Admin):
+  ✅ 如订阅状态为 active，会收到 SubscriptionActivatedEvent 对应的邮件通知
+  ✅ 会员列表应显示新的付费会员
+  ✅ 会员详情应显示订阅信息
+
+定位动作:
+  1. 查 Stripe Dashboard → Subscriptions → 确认订阅已创建
+  2. 查 Ghost 日志 → 确认事件被接收
+  3. 查订阅表是否新增记录
+  4. 检查是否有对应的 checkout.session.completed 事件
+  5. 如果是新会员：检查 members 表是否创建
+  6. 如果 status=active：检查 SubscriptionCreatedEvent 是否分发
+```
+
+**事件 7: customer.subscription.updated (incomplete → active)**
+
+**触发场景**：3D Secure 验证完成、首次付款成功、pending 状态转为 active
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.updated"
+  → 需要配合检查事件数据中的 previous_attributes.status
+  正常: 日志存在，无 Error
+  异常:
+    - "No member found" → 会员未关联
+    - "ConflictError" → 重复事件
+
+数据库核对:
+  1. SELECT data->'$.data.object.status' as current_status,
+            data->'$.data.previous_attributes.status' as previous_status
+     FROM members_stripe_webhook_events
+     WHERE type = 'customer.subscription.updated'
+     AND data->'$.data.previous_attributes.status' = 'incomplete'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: previous_status = 'incomplete', current_status = 'active'
+  2. SELECT id, status, mrr, cancel_at_period_end 
+     FROM members_stripe_customers_subscriptions
+     WHERE stripe_subscription_id = '{subscription_id}';
+     → 期望: status = 'active'
+  3. SELECT id, email, status FROM members 
+     WHERE id = (SELECT member_id FROM members_stripe_customers_subscriptions 
+                  WHERE stripe_subscription_id = '{subscription_id}');
+     → 期望: status = 'paid'
+  4. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE subscription_id = (SELECT id FROM members_stripe_customers_subscriptions 
+                             WHERE stripe_subscription_id = '{subscription_id}')
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'active'
+
+前端验证 (Portal):
+  ❌ 无直接反馈（需用户主动刷新页面）
+  ⚠️ 注意：3D Secure 完成后，用户可能仍在 Stripe 页面
+  ⚠️ 用户返回后需要刷新才能看到最新状态
+  ✅ 如果已登录且刷新，member.paid = true
+  ✅ 显示当前订阅价格和 tier
+
+前端验证 (Admin):
+  ✅ 收到 "New paid subscription" 邮件（SubscriptionActivatedEvent）
+  ✅ 会员列表：状态从 Free → Paid（或从不完整 → Paid）
+  ✅ 会员详情：显示完整的订阅信息
+  ✅ 仪表盘：MRR 增加
+
+定位动作:
+  1. 确认这是 incomplete → active 的转换（查 previous_attributes）
+  2. 查 Stripe Dashboard → 确认付款是否成功
+  3. 查订阅表 status 是否已变为 'active'
+  4. 查 members.status 是否已变为 'paid'
+  5. 查 members_paid_subscription_events.type = 'active'
+  6. 检查 SubscriptionActivatedEvent 是否分发
+  7. 如果邮件未发送：检查 StaffService 是否正常监听
+```
+
+**事件 8: customer.subscription.updated (canceled → active - 恢复订阅)**
+
+**触发场景**：用户在 Portal 点击 "Renew subscription"、或在期限内恢复取消的订阅
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.updated"
+  → 需要检查 previous_attributes.cancel_at_period_end 或 previous_attributes.status
+  正常: 日志存在
+  异常:
+    - "No member found" → 会员未关联
+
+数据库核对:
+  1. SELECT data->'$.data.object.cancel_at_period_end' as current_cancel,
+            data->'$.data.previous_attributes.cancel_at_period_end' as previous_cancel
+     FROM members_stripe_webhook_events
+     WHERE type = 'customer.subscription.updated'
+     AND data->'$.data.previous_attributes.cancel_at_period_end' = true
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: previous_cancel = true, current_cancel = false
+  2. SELECT id, status, cancel_at_period_end, current_period_end 
+     FROM members_stripe_customers_subscriptions
+     WHERE stripe_subscription_id = '{subscription_id}';
+     → 期望: cancel_at_period_end = 0 (false)
+     → 期望: status = 'active'
+  3. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE subscription_id = (SELECT id FROM members_stripe_customers_subscriptions 
+                             WHERE stripe_subscription_id = '{subscription_id}')
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'reactivated' 或 'active'
+  4. SELECT id, email, status FROM members 
+     WHERE id = (SELECT member_id FROM members_stripe_customers_subscriptions 
+                  WHERE stripe_subscription_id = '{subscription_id}');
+     → 期望: status = 'paid'
+
+前端验证 (Portal):
+  ✅ "Renew subscription" 按钮消失
+  ✅ 恢复正常付费 UI 显示
+  ✅ 不再显示到期日期警告
+  ✅ "Cancel subscription" 按钮重新出现
+  ✅ member.paid = true（刷新后确认）
+
+前端验证 (Admin):
+  ❌ 无邮件通知（没有专门的恢复订阅通知）
+  ✅ 会员列表：状态从 Canceling → Paid
+  ✅ 会员详情：不再显示 "Expires on {日期}"
+  ✅ 仪表盘：预期流失率下降，MRR 保持稳定
+
+定位动作:
+  1. 确认这是恢复操作（cancel_at_period_end 从 true 变 false）
+  2. 查订阅表 cancel_at_period_end 是否已变为 0
+  3. 查 members_paid_subscription_events.type
+  4. 注意：此事件不触发 SubscriptionActivatedEvent（因为原本就是 active）
+  5. 确认恢复来源：Portal 操作 vs Stripe Dashboard 操作
+  6. 检查 current_period_end 是否已延长
+```
+
+**事件 9: charge.refunded**
+
+**触发场景**：全额退款、部分退款、争议退款
+
+```
+日志确认:
+  搜索: "Handling webhook charge.refunded"
+  正常: 日志存在
+  异常:
+    - 找不到日志 → webhook 未到达
+    - "No member found" → 会员未关联
+
+数据库核对:
+  1. SELECT * FROM members_stripe_webhook_events 
+     WHERE type = 'charge.refunded'
+     ORDER BY created_at DESC LIMIT 1;
+  2. 查 data 字段：
+     - data.object.amount_refunded: 退款金额
+     - data.object.amount: 原始金额
+     - data.object.refunded: 是否全额退款
+     - data.object.customer: Stripe customer ID
+  3. SELECT id, email, status FROM members 
+     WHERE id = (SELECT member_id FROM members_stripe_customers 
+                  WHERE customer_id = '{customer_id}');
+     ⚠️ 注意：退款事件本身不会自动更新会员状态
+  4. SELECT id, status, cancel_at_period_end 
+     FROM members_stripe_customers_subscriptions
+     WHERE member_id = '{会员ID}';
+     ⚠️ 注意：退款事件本身不会自动取消订阅
+  5. SELECT * FROM members_payments 
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC;
+     ⚠️ 注意：当前版本可能不会自动记录退款
+
+前端验证 (Portal):
+  ❌ 无直接反馈（除非订阅也被取消）
+  ⚠️ 如果是全额退款并取消订阅：
+     → 状态变为 Free
+     → 显示 "Upgrade" 按钮
+  ⚠️ 如果只是部分退款：
+     → 仍显示 Paid 状态
+     → 无任何退款提示
+
+前端验证 (Admin):
+  ❌ 无专门的退款邮件通知
+  ⚠️ 如果同时取消订阅：
+     → 收到 "Paid subscription canceled" 邮件
+     → 会员列表状态 = Canceled
+  ⚠️ 如果只是退款：
+     → 会员列表仍显示 Paid
+     → 无退款标记
+  ⚠️ 注意：需要手动核对 Stripe Dashboard
+
+定位动作:
+  1. ⚠️ 重要：charge.refunded 事件本身不会自动处理会员状态
+  2. 查 data.object.refunded 确认是全额还是部分退款
+  3. 查 data.object.amount_refunded 确认退款金额
+  4. 查是否有对应的 subscription.deleted 或 subscription.updated 事件
+  5. 如果是全额退款：需要手动确认订阅是否应该取消
+  6. 查 Stripe Dashboard → Payments → 确认退款详情
+  7. 查 members_payments 表：当前版本可能需要手动记录退款
+  8. 如果应该取消订阅：检查是否有管理员手动取消操作
+```
+
 ---
 
 #### 6.1.7 快速排查命令汇总
