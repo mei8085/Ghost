@@ -401,87 +401,449 @@ try {
 
 ## 5. 投递反馈回流机制
 
-### 5.1 事件获取方式
+### 5.1 事件获取方式：API 轮询 vs Webhook
 
-Ghost **不使用 Webhook**，而是通过**定时轮询** Mailgun Events API 获取投递反馈：
+Ghost **不使用 Webhook** 推送，而是通过**定时轮询** Mailgun Events API 获取投递反馈。这是一个重要的架构决策：
 
 ```javascript
 // email-analytics-provider-mailgun.js:4
 const DEFAULT_EVENT_FILTER = 'delivered OR opened OR failed OR unsubscribed OR complained';
 ```
 
-### 5.2 定时任务类型
+**为什么选择轮询而非 Webhook**：
+1. **可靠性**：轮询不依赖外部服务的推送可靠性，网络波动不会丢失事件
+2. **最终一致性处理**：Mailgun Events API 有 30 分钟的稳定延迟，轮询+补漏机制更好处理
+3. **幂等性**：通过时间游标控制拉取范围，天然支持断点续传和重复拉取
 
-| 任务 | 频率 | 事件类型 | 说明 |
-|------|------|----------|------|
-| `fetchLatestOpenedEvents` | 高频 | opened | 打开事件（更新频繁） |
-| `fetchLatestNonOpenedEvents` | 高频 | delivered, failed, unsubscribed, complained | 其他事件 |
-| `fetchMissing` | 低频 | 全部 | 补漏（30分钟后 Mailgun 存储稳定） |
-| `fetchScheduled` | 按需 | 全部 | 手动调度的历史数据拉取 |
+### 5.2 事件真实性校验机制
 
-### 5.3 信任阈值与补漏机制
+由于不使用 Webhook（无签名校验），事件真实性依赖以下多层校验：
+
+#### 5.2.1 第一层：API 凭证认证
+
+```javascript
+// mailgun-client.js:360-377
+getInstance() {
+    const mailgunConfig = this.#getConfig();
+    if (!mailgunConfig) {
+        return null;
+    }
+
+    const formData = require('form-data');
+    const Mailgun = require('mailgun.js').default;
+
+    const baseUrl = new URL(mailgunConfig.baseUrl);
+    const mailgun = new Mailgun(formData);
+
+    return mailgun.client({
+        username: 'api',
+        key: mailgunConfig.apiKey,  // Mailgun API Key 认证
+        url: baseUrl.origin,
+        timeout: 60000
+    });
+}
+```
+
+**认证保障**：
+- 使用配置的 `mailgun_api_key` 通过 HTTPS 调用 Mailgun API
+- 只有持有有效 API Key 的请求才能获取事件数据
+- 这是事件来源真实性的基础保障
+
+#### 5.2.2 第二层：域范围过滤
+
+```javascript
+// mailgun-client.js:177-202
+#fetchEventsFromDomain(domain, mailgunInstance, mailgunOptions, batchHandler, {maxEvents}) {
+    // 从配置的域名获取事件
+    let page = await this.getEventsFromMailgun(mailgunInstance, domain, mailgunOptions);
+    ...
+}
+
+// mailgun-client.js:192-202
+#getDomainsToFetch(mailgunConfig) {
+    const domains = [mailgunConfig.domain];  // 主域名
+
+    const fallbackDomain = this.#config.get('hostSettings:managedEmail:fallbackDomain');
+    if (fallbackDomain && fallbackDomain !== mailgunConfig.domain) {
+        domains.push(fallbackDomain);  // 备用域名（域预热场景）
+    }
+
+    return domains;  // 只从 Ghost 配置的域名拉取事件
+}
+```
+
+**域范围保障**：
+- 只从配置的 `mailgun_domain`（和可选的 fallbackDomain）拉取事件
+- 不会获取到其他域名的事件
+- 通过 `tags: 'bulk-email AND ghost-email'` 进一步过滤
+
+```javascript
+// email-analytics-provider-mailgun.js:10-16
+constructor({config, settings, labs}) {
+    this.mailgunClient = new MailgunClient({config, settings, labs});
+    this.tags = [...DEFAULT_TAGS];  // ['bulk-email', 'ghost-email']
+
+    if (config.get('bulkEmail:mailgun:tag')) {
+        this.tags.push(config.get('bulkEmail:mailgun:tag'));
+    }
+}
+
+// email-analytics-provider-mailgun.js:31-39
+const mailgunOptions = {
+    limit: PAGE_LIMIT,
+    event: options?.events ? options.events.join(' OR ') : DEFAULT_EVENT_FILTER,
+    tags: this.tags.join(' AND '),  // 标签过滤
+    ...
+};
+```
+
+#### 5.2.3 第三层：事件 ID 去重
+
+虽然 Mailgun API 的分页机制本身避免重复，但 Ghost 通过**时间游标**实现额外的去重保证：
+
+```javascript
+// email-analytics-service.js:141-157
+async getLastNonOpenedEventTimestamp() {
+    return this.#fetchLatestNonOpenedData?.lastEventTimestamp 
+        ?? (await this.queries.getLastEventTimestamp(
+            this.#fetchLatestNonOpenedData.jobName,
+            ['delivered','failed']
+        )) 
+        ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
+}
+
+// email-analytics-service.js:497-506
+// 消费完当前窗口后，游标前进 1 秒
+if (!error && eventCount > 0 && fetchData.lastEventTimestamp 
+    && fetchData.lastEventTimestamp.getTime() < Date.now() - 2000) {
+    
+    await this.queries.setJobTimestamp(
+        fetchData.jobName, 
+        'finished', 
+        new Date(fetchData.lastEventTimestamp.getTime())
+    );
+    
+    if (eventCount < maxEvents) {
+        // 全部消费完才前进 1 秒，避免秒级边界事件遗漏
+        fetchData.lastEventTimestamp = new Date(fetchData.lastEventTimestamp.getTime() + 1000);
+    }
+}
+```
+
+**去重保障**：
+- 每次拉取从上一次的 `lastEventTimestamp` 开始
+- 只有完整消费完当前秒的所有事件后，游标才前进 1 秒
+- `jobs` 表持久化游标，服务重启后可续传
+
+#### 5.2.4 第四层：事件关联校验
+
+事件必须能关联到本地已有的邮件记录才算有效：
+
+```javascript
+// mailgun-client.js:304-328
+normalizeEvent(event) {
+    const providerId = event?.message?.headers['message-id'];
+
+    // 必须有 email-id (user-variables) 或 message-id (providerId)
+    if (!providerId && !(event['user-variables'] && event['user-variables']['email-id'])) {
+        logging.error('Received invalid event from Mailgun');
+        logging.error(event);
+        return null;  // 丢弃无法关联的事件
+    }
+
+    return {
+        id: event.id,
+        type: event.event,
+        severity: event.severity,
+        recipientEmail: event.recipient,
+        emailId: event['user-variables']?.['email-id'],
+        providerId: providerId,
+        timestamp: new Date(event.timestamp * 1000),
+        ...
+    };
+}
+```
+
+**关联校验**：
+- 事件必须包含 `v:email-id`（发送时注入的 user-variable）或 `message-id`
+- 后续处理中会进一步校验 emailId 是否在本地 `emails` 表存在
+
+#### 5.2.5 第五层：乱序保护（时间戳校验）
+
+Mailgun 事件可能乱序到达，Ghost 通过多重机制保护：
+
+```javascript
+// email-event-storage.js:36-59
+async handleDelivered(event) {
+    const useBatchProcessing = config.get('emailAnalytics:batchProcessing');
+
+    if (useBatchProcessing) {
+        // 内存层：保持最早时间戳
+        const timestamp = moment.utc(event.timestamp).format('YYYY-MM-DD HH:mm:ss');
+        const existing = this.#pendingUpdates.delivered.get(event.emailRecipientId);
+        
+        // 如果已有更新，只保留更早的时间戳
+        if (!existing || timestamp < existing) {
+            this.#pendingUpdates.delivered.set(event.emailRecipientId, timestamp);
+        }
+    } else {
+        // 数据库层：只更新 NULL 值
+        const rowCount = await this.#db.knex('email_recipients')
+            .where('id', '=', event.emailRecipientId)
+            .whereNull('delivered_at')  // 关键：已设置则不覆盖
+            .update({
+                delivered_at: moment.utc(event.timestamp).format('YYYY-MM-DD HH:mm:ss')
+            });
+    }
+}
+```
+
+**乱序保护**：
+1. **内存层**：Map 中只保留最早时间戳
+2. **数据库层**：`WHERE xxx_at IS NULL` 确保只写入一次
+3. **事件时间戳**：`failed_at` 更新时也比较 `existing.get('failed_at') > event.timestamp`
+
+### 5.3 定时任务类型与时间窗口策略
+
+| 任务 | Job Name | 频率 | 事件类型 | 时间窗口 | 说明 |
+|------|----------|------|----------|----------|------|
+| `fetchLatestOpenedEvents` | `email-analytics-latest-opened` | 高频 | opened | `[lastEventTs, now-1min]` | 打开事件频繁，快速更新 |
+| `fetchLatestNonOpenedEvents` | `email-analytics-latest-others` | 高频 | delivered, failed, unsubscribed, complained | `[lastEventTs, now-1min]` | 其他状态事件 |
+| `fetchMissing` | `email-analytics-missing` | 低频 | 全部 | `[lastJobTs, min(now-30min, lastFetchBegin)]` | 补漏（30分钟后 Mailgun 存储稳定） |
+| `fetchScheduled` | `email-analytics-scheduled` | 按需 | 全部 | 手动指定 | 历史数据回溯 |
 
 ```javascript
 // email-analytics-service.js:38-39
-const TRUST_THRESHOLD_MS = 30 * 60 * 1000;  // 30分钟
-const FETCH_LATEST_END_MARGIN_MS = 1 * 60 * 1000;  // 1分钟
+const TRUST_THRESHOLD_MS = 30 * 60 * 1000;  // 30分钟 - Mailgun 存储稳定时间
+const FETCH_LATEST_END_MARGIN_MS = 1 * 60 * 1000;  // 1分钟 - 避免秒级边界
+
+// email-analytics-service.js:165-175
+async fetchLatestOpenedEvents({maxEvents = Infinity} = {}) {
+    const begin = await this.getLastOpenedEventTimestamp();
+    const end = new Date(Date.now() - FETCH_LATEST_END_MARGIN_MS);  // 只拉取 1 分钟前
+
+    if (end <= begin) {
+        return createEmptyResult();  // 时间窗口无效则跳过
+    }
+    return await this.#fetchEvents(this.#fetchLatestOpenedData, {begin, end, maxEvents, eventTypes: ['opened']});
+}
+
+// email-analytics-service.js:203-221
+async fetchMissing({maxEvents = Infinity} = {}) {
+    const begin = await this.getLastMissingEventTimestamp();
+    
+    // 结束时间取「30分钟前」和「上一次 fetchLatest 开始时间」的较小值
+    const end = new Date(
+        Math.min(
+            Date.now() - TRUST_THRESHOLD_MS,
+            this.#fetchLatestNonOpenedData?.lastBegin?.getTime() || Date.now()
+        )
+    );
+
+    if (end <= begin) {
+        return createEmptyResult();
+    }
+    return await this.#fetchEvents(this.#fetchMissingData, {begin, end, maxEvents});
+}
 ```
 
-**设计原因**：Mailgun 的事件存储有最终一致性延迟，所以：
-- `fetchLatest` 只拉取到 **1分钟前** 的事件
-- `fetchMissing` 拉取 **30分钟前** 到上一次拉取的事件（此时数据已稳定）
+**双窗口设计原因**：
+- `fetchLatest` 快速获取新事件（延迟 1 分钟）
+- `fetchMissing` 在 30 分钟后回扫补漏（此时 Mailgun 数据已稳定，不会遗漏）
 
 ### 5.4 事件规范化
 
 ```javascript
 // mailgun-client.js:304-328
 normalizeEvent(event) {
+    const providerId = event?.message?.headers['message-id'];
+
+    if (!providerId && !(event['user-variables'] && event['user-variables']['email-id'])) {
+        logging.error('Received invalid event from Mailgun');
+        logging.error(event);
+        return null;
+    }
+
     return {
-        id: event.id,
-        type: event.event,           // delivered / opened / failed / unsubscribed / complained
-        severity: event.severity,    // permanent / temporary (仅 failed)
-        recipientEmail: event.recipient,
-        emailId: event['user-variables']?.['email-id'],  // Ghost 的 email ID
-        providerId: event?.message?.headers['message-id'],  // Mailgun message-id
-        timestamp: new Date(event.timestamp * 1000),
+        id: event.id,                              // Mailgun 事件唯一 ID
+        type: event.event,                         // delivered / opened / failed / unsubscribed / complained
+        severity: event.severity,                  // permanent / temporary (仅 failed)
+        recipientEmail: event.recipient,           // 收件人邮箱
+        emailId: event['user-variables']?.['email-id'],  // Ghost 的 email ID（发送时注入）
+        providerId: providerId,                    // Mailgun message-id（批次级别）
+        timestamp: new Date(event.timestamp * 1000),  // Mailgun Unix 时间戳 → Date
         error: event['delivery-status'] ? {
             code: event['delivery-status'].code,
-            message: event['delivery-status'].message,
-            enhancedCode: event['delivery-status']['enhanced-code']
+            message: (event['delivery-status'].message || event['delivery-status'].description).substring(0, 2000),
+            enhancedCode: event['delivery-status']['enhanced-code']?.toString()?.substring(0, 50) ?? null
         } : null
     };
 }
 ```
 
-### 5.5 事件匹配与归并
+### 5.5 事件匹配与归并：email-id 缺失时的 provider_id 回查
 
-#### 5.5.1 收件人匹配策略
+#### 5.5.1 关联键的两种来源
+
+发送时 Ghost 注入了两种关联键：
+
+```javascript
+// mailgun-client.js:84-86
+if (message.id) {
+    messageData['v:email-id'] = message.id;  // 1. User Variable: email-id（邮件级别）
+}
+
+// Mailgun 返回时还带：
+// 2. Message-Id Header: <20240510...@mg.example.com>（批次级别）
+```
+
+#### 5.5.2 收件人匹配策略
 
 ```javascript
 // email-event-processor.js:208-244
 async getRecipient(emailIdentification, recipientCache) {
-    // 1. 获取 emailId (从 v:email-id 或通过 provider_id 查 email_batches)
-    const emailId = emailIdentification.emailId ?? await this.getEmailId(providerId);
+    // 前置校验：必须有 email 且有 emailId 或 providerId
+    if (!emailIdentification.emailId && !emailIdentification.providerId) {
+        return;  // 无法关联，丢弃事件
+    }
+
+    // 1. 优先使用 emailId (v:email-id)，否则通过 providerId 回查
+    const emailId = emailIdentification.emailId 
+        ?? await this.getEmailId(emailIdentification.providerId);
     
-    // 2. 通过 (email, emailId) 匹配 email_recipients
-    const {id, member_id} = await this.#db.knex('email_recipients')
+    if (!emailId) {
+        return;  // 回查失败，丢弃
+    }
+
+    // 2. 查缓存（批量模式）
+    if (recipientCache) {
+        const key = `${emailIdentification.email}:${emailId}`;
+        const cached = recipientCache.get(key);
+        if (cached) {
+            return cached;
+        }
+    }
+
+    // 3. 通过 (member_email, email_id) 二元组定位收件人
+    const {id: emailRecipientId, member_id: memberId} = await this.#db.knex('email_recipients')
         .select('id', 'member_id')
         .where('member_email', emailIdentification.email)
         .where('email_id', emailId)
-        .first();
+        .first() || {};
+
+    if (emailRecipientId && memberId) {
+        return {
+            emailRecipientId,  // email_recipients 表主键
+            memberId,          // members 表主键
+            emailId            // emails 表主键
+        };
+    }
 }
 ```
 
-#### 5.5.2 批量查询优化
+#### 5.5.3 provider_id 回查机制（email-id 缺失时）
+
+```javascript
+// email-event-processor.js:260-281
+async getEmailId(providerId) {
+    // 1. 内存缓存：避免重复查询
+    if (this.providerIdEmailIdMap[providerId]) {
+        return this.providerIdEmailIdMap[providerId];
+    }
+
+    // 2. 数据库查询：email_batches 表存储了 provider_id → email_id 映射
+    const {emailId} = await this.#db.knex('email_batches')
+        .select('email_id as emailId')
+        .where('provider_id', providerId)
+        .first() || {};
+
+    if (!emailId) {
+        return;  // 查不到，可能是测试邮件或过期数据
+    }
+
+    // 3. 写入缓存
+    this.providerIdEmailIdMap[providerId] = emailId;
+    return emailId;
+}
+```
+
+**关联链**：
+```
+Mailgun Event
+    │
+    ├──▶ v:email-id (user-variable) ──▶ emails.id ──┐
+    │                                               ├──▶ email_recipients
+    └──▶ Message-Id (provider_id) ──▶ email_batches.email_id ──┘
+                                                │
+                                                └──▶ (member_email, email_id) 定位具体收件人
+```
+
+#### 5.5.4 批量查询优化
 
 ```javascript
 // email-event-processor.js:288-356
 async batchGetRecipients(emailIdentifications) {
-    // Step 1: 批量解析 providerId → emailId
-    // Step 2: 构建 OR 查询批量获取所有 recipient
-    // Step 3: 构建 Map<email:emailId, recipientInfo> 缓存
+    const recipientCache = new Map();
+
+    // Step 1: 批量解析 providerId → emailId（一次查询所有）
+    const providerIds = [...new Set(
+        emailIdentifications
+            .filter(e => e.providerId && !e.emailId)
+            .map(e => e.providerId)
+    )];
+
+    if (providerIds.length > 0) {
+        const providerIdMapping = await this.#db.knex('email_batches')
+            .select('provider_id', 'email_id')
+            .whereIn('provider_id', providerIds);  // 批量 IN 查询
+
+        for (const row of providerIdMapping) {
+            this.providerIdEmailIdMap[row.provider_id] = row.email_id;
+        }
+    }
+
+    // Step 2: 构建所有 (email, emailId) 查找对
+    const lookups = [];
+    for (const identification of emailIdentifications) {
+        const emailId = identification.emailId ?? this.providerIdEmailIdMap[identification.providerId];
+        if (emailId && identification.email) {
+            lookups.push({email: identification.email, emailId});
+        }
+    }
+
+    // Step 3: 构建 OR 查询，批量获取所有 recipient
+    const recipientQuery = this.#db.knex('email_recipients')
+        .select('id', 'member_id', 'email_id', 'member_email');
+
+    recipientQuery.where(function () {
+        for (const lookup of lookups) {
+            this.orWhere(function () {
+                this.where('member_email', lookup.email)
+                    .andWhere('email_id', lookup.emailId);
+            });
+        }
+    });
+
+    const recipients = await recipientQuery;
+
+    // Step 4: 构建 Map<email:emailId, recipientInfo> 缓存
+    for (const recipient of recipients) {
+        const key = `${recipient.member_email}:${recipient.email_id}`;
+        recipientCache.set(key, {
+            emailRecipientId: recipient.id,
+            memberId: recipient.member_id,
+            emailId: recipient.email_id
+        });
+    }
+
+    return recipientCache;
 }
 ```
+
+**性能优化**：
+- 避免 N+1 查询：所有 provider_id 一次 IN 查询
+- 所有收件人一次 OR 查询
+- 内存 Map 缓存，O(1) 查找
 
 ### 5.6 事件存储与批量更新
 
@@ -490,7 +852,7 @@ async batchGetRecipients(emailIdentifications) {
 ```javascript
 // email-event-storage.js:21-25
 this.#pendingUpdates = {
-    delivered: new Map(),  // recipientId → timestamp
+    delivered: new Map(),  // emailRecipientId → timestamp string
     opened: new Map(),
     failed: new Map()
 };
@@ -499,57 +861,237 @@ this.#pendingUpdates = {
 #### 5.6.2 批量 SQL 更新（CASE 语句）
 
 ```javascript
-// email-event-storage.js:289-298
-const sql = `
-    UPDATE email_recipients
-    SET delivered_at = CASE id 
-        WHEN 'id1' THEN '2024-05-10 10:00:00'
-        WHEN 'id2' THEN '2024-05-10 10:00:01'
-        ...
-    END
-    WHERE id IN (?, ?, ...)
-    AND delivered_at IS NULL  -- 乱序保护
-`;
+// email-event-storage.js:277-298
+async #flushDeliveredUpdates() {
+    const updates = Array.from(this.#pendingUpdates.delivered.entries());
+    
+    // 构建 CASE 语句
+    const recipientIds = updates.map(([id]) => id);
+    const caseClauses = updates.map(([id, timestamp]) => {
+        return `WHEN '${id}' THEN '${timestamp}'`;
+    }).join(' ');
+
+    const sql = `
+        UPDATE email_recipients
+        SET delivered_at = CASE id ${caseClauses} END
+        WHERE id IN (${recipientIds.map(() => '?').join(',')})
+        AND delivered_at IS NULL  -- 数据库层乱序保护
+    `;
+
+    const rowCount = await this.#db.knex.raw(sql, recipientIds);
+    this.recordEventStored('delivered', updates.length);
+    return rowCount;
+}
 ```
 
-#### 5.6.3 乱序保护
+#### 5.6.3 三层乱序保护
+
+| 层级 | 机制 | 代码位置 |
+|------|------|----------|
+| **内存层** | Map 中只保留最早时间戳 | `email-event-storage.js:44-47` |
+| **SQL 层** | `WHERE delivered_at IS NULL` | `email-event-storage.js:54` |
+| **失败记录层** | 比较时间戳，永久失败不可覆盖 | `email-event-storage.js:156-164` |
 
 ```javascript
-// email-event-storage.js:44-47
-// 保持最早时间戳
-if (!existing || timestamp < existing) {
-    this.#pendingUpdates.delivered.set(event.emailRecipientId, timestamp);
-}
+// email-event-storage.js:125-176 失败记录的乱序保护
+async saveFailure(severity, event, options) {
+    const existing = await this.#models.EmailRecipientFailure.findOne({
+        email_recipient_id: event.emailRecipientId
+    }, {...options, require: false, forUpdate: true});
 
-// SQL 层面也保护
-AND delivered_at IS NULL
+    if (!existing) {
+        // 新建失败记录
+        await this.#models.EmailRecipientFailure.add({...});
+    } else {
+        if (existing.get('severity') === 'permanent') {
+            // 已永久失败 → 不再更新
+            return;
+        }
+
+        if (existing.get('failed_at') > event.timestamp) {
+            // 新事件时间更早 → 忽略（乱序保护）
+            return;
+        }
+
+        // 可以更新（temporary → permanent，或更新为更近的 temporary）
+        await existing.save({
+            severity,
+            message: event.error.message,
+            ...
+        }, {...options, patch: true});
+    }
+}
 ```
 
-### 5.7 事件类型处理
+### 5.7 事件类型处理：Temporary vs Permanent Failed
 
-| 事件类型 | 处理方法 | 数据库操作 |
-|----------|----------|------------|
-| **delivered** | `handleDelivered()` | 更新 `email_recipients.delivered_at` |
-| **opened** | `handleOpened()` | 更新 `email_recipients.opened_at` |
-| **failed (permanent)** | `handlePermanentFailed()` | 更新 `failed_at` + 写入 `email_recipient_failures` |
-| **failed (temporary)** | `handleTemporaryFailed()` | 仅写入 `email_recipient_failures` |
-| **unsubscribed** | `handleUnsubscribed()` | 更新成员订阅关系 + 移除 Mailgun 退订列表 |
-| **complained** | `handleComplained()` | 写入 `email_spam_complaint_events` + 移除 Mailgun 投诉列表 |
+#### 5.7.1 事件处理矩阵
 
-### 5.8 统计聚合
+| 事件类型 | severity | 处理方法 | email_recipients | email_recipient_failures | 本地统计 |
+|----------|----------|----------|------------------|--------------------------|----------|
+| **delivered** | - | `handleDelivered()` | `delivered_at = ts` | - | `delivered_count++` |
+| **opened** | - | `handleOpened()` | `opened_at = ts` | - | `opened_count++` |
+| **failed** | `permanent` | `handlePermanentFailed()` | `failed_at = ts` | 插入 | `failed_count++` |
+| **failed** | `temporary` | `handleTemporaryFailed()` | - | 插入 | **不增加** |
+| **unsubscribed** | - | `handleUnsubscribed()` | - | - | - |
+| **complained** | - | `handleComplained()` | - | - | - |
+
+#### 5.7.2 Permanent Failed（硬弹）- 计入统计
+
+```javascript
+// email-event-storage.js:88-112
+async handlePermanentFailed(event) {
+    const useBatchProcessing = config.get('emailAnalytics:batchProcessing');
+
+    if (useBatchProcessing) {
+        // 1. 更新 email_recipients.failed_at（计入统计）
+        const timestamp = moment.utc(event.timestamp).format('YYYY-MM-DD HH:mm:ss');
+        const existing = this.#pendingUpdates.failed.get(event.emailRecipientId);
+        if (!existing || timestamp < existing) {
+            this.#pendingUpdates.failed.set(event.emailRecipientId, timestamp);
+        }
+    } else {
+        // 直接更新，只写 NULL
+        await this.#db.knex('email_recipients')
+            .where('id', '=', event.emailRecipientId)
+            .whereNull('failed_at')
+            .update({failed_at: timestamp});
+    }
+    
+    // 2. 写入详细失败记录
+    await this.saveFailure('permanent', event);
+}
+```
+
+#### 5.7.3 Temporary Failed（软弹）- 不计入统计
+
+```javascript
+// email-event-storage.js:114-116
+async handleTemporaryFailed(event) {
+    // 仅写入失败记录，不更新 email_recipients.failed_at
+    await this.saveFailure('temporary', event);
+}
+```
+
+**设计原因**：
+- **Permanent**：邮箱不存在、域名不存在等致命错误 → 计入失败率
+- **Temporary**：收件箱满、连接超时、灰名单等临时错误 → Mailgun 会自动重试，不计入本地失败统计
+
+#### 5.7.4 统计聚合逻辑
+
+```javascript
+// queries.js:207-222
+async aggregateEmailStats(emailId, updateOpenedCount) {
+    // delivered_count = COUNT(email_recipients WHERE delivered_at IS NOT NULL)
+    const [deliveredCount] = await db.knex('email_recipients')
+        .count('id as count')
+        .whereRaw('email_id = ? AND delivered_at IS NOT NULL', [emailId]);
+    
+    // failed_count = COUNT(email_recipients WHERE failed_at IS NOT NULL)
+    // 注意：只有 permanent failed 会设置 failed_at
+    const [failedCount] = await db.knex('email_recipients')
+        .count('id as count')
+        .whereRaw('email_id = ? AND failed_at IS NOT NULL', [emailId]);
+
+    const updateData = {
+        delivered_count: deliveredCount.count,
+        failed_count: failedCount.count  // 只统计 permanent failed
+    };
+
+    if (updateOpenedCount) {
+        const [openedCount] = await db.knex('email_recipients')
+            .count('id as count')
+            .whereRaw('email_id = ? AND opened_at IS NOT NULL', [emailId]);
+        updateData.opened_count = openedCount.count;
+    }
+
+    await db.knex('emails').update(updateData).where('id', emailId);
+}
+```
+
+#### 5.7.5 失败重试截止判断
+
+邮件发送阶段的重试与邮件投递后的失败是两个不同概念：
+
+**发送阶段重试**（BatchSendingService）：
+```javascript
+// batch-sending-service.js:151-158
+// 计算重试截止时间
+const expectedBatchCount = Math.ceil(email.get('email_count') / 1000);
+const minimumSecondsPerBatch = 26;  // 每批预估最低耗时
+const stopAfter = Math.max(
+    expectedBatchCount * minimumSecondsPerBatch * 1000,
+    this.#BEFORE_RETRY_CONFIG.maxTime  // 至少 10 分钟
+);
+email._retryCutOffTime = new Date(startTime + stopAfter);
+
+// 在重试配置中应用截止时间
+#getBeforeRetryConfig(email) {
+    if (email._retryCutOffTime) {
+        return {...this.#BEFORE_RETRY_CONFIG, stopAfterDate: email._retryCutOffTime};
+    }
+    return this.#BEFORE_RETRY_CONFIG;
+}
+```
+
+**投递后失败**（Mailgun 处理）：
+- **Temporary Failed**：Mailgun 会自动重试（通常重试 8 小时，间隔递增）
+- **Permanent Failed**：Mailgun 停止重试，Ghost 计入 `failed_count`
+- Ghost 不主动重试已提交给 Mailgun 的邮件
+
+### 5.8 EventProcessingResult 事件计数
+
+```javascript
+// event-processing-result.js:1-64
+class EventProcessingResult {
+    constructor(result = {}) {
+        this.delivered = 0;
+        this.opened = 0;
+        this.temporaryFailed = 0;   // 软弹单独计数
+        this.permanentFailed = 0;   // 硬弹单独计数
+        this.unsubscribed = 0;
+        this.complained = 0;
+        this.unhandled = 0;
+        this.unprocessable = 0;     // 无法关联的事件
+        
+        this.emailIds = [];    // 需要聚合的 email ID
+        this.memberIds = [];   // 需要聚合的 member ID
+    }
+
+    get totalEvents() {
+        return this.delivered
+            + this.opened
+            + this.temporaryFailed
+            + this.permanentFailed
+            + this.unsubscribed
+            + this.complained
+            + this.unhandled
+            + this.unprocessable;
+    }
+}
+```
+
+### 5.9 统计聚合触发时机
 
 ```javascript
 // email-analytics-service.js:424-444
-// 每 5 分钟或 5000 个会员聚合一次
-if ((Date.now() - lastAggregation > 5 * 60 * 1000 || processingResult.memberIds.length > 5000) && eventCount > 0) {
-    await this.aggregateStats(processingResult, includeOpenedEvents);
+// 每 5 分钟或 5000 个会员触发一次中间聚合
+if ((Date.now() - lastAggregation > 5 * 60 * 1000 
+    || processingResult.memberIds.length > 5000) 
+    && eventCount > 0) {
+    
+    const aggregationTimings = await this.aggregateStats(processingResult, includeOpenedEvents);
+    
+    // 清空已聚合的 ID，避免重复聚合
+    processingResult.emailIds.forEach(id => allEmailIds.delete(id));
+    processingResult.memberIds.forEach(id => allMemberIds.delete(id));
     processingResult = new EventProcessingResult();
 }
 ```
 
 聚合内容：
-- **emails 表**：`delivered_count`, `opened_count`, `failed_count`
-- **members 表**：会员邮件发送统计
+- **emails 表**：`delivered_count`（permanent+delivered? 不，只有 delivered）、`opened_count`、`failed_count`（仅 permanent）
+- **members 表**：`email_count`、`email_opened_count`、`email_open_rate`（需 ≥5 封追踪邮件才计算）
 
 ---
 
