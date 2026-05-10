@@ -430,7 +430,510 @@ async handleInvoiceEvent(invoice) {
 }
 ```
 
-## 6. 前端反馈协作与状态同步
+## 6. 事件级映射表与状态偏差分析
+
+本节详细分析每个 Stripe webhook 事件触发的连锁反应，包括 Ghost Domain Events、会员通知、前端反馈，以及乱序/重复事件时可能出现的状态偏差。
+
+### 6.1 Stripe 事件 → 会员通知 → 前端反馈 完整映射表
+
+#### 6.1.1 事件流转总览
+
+```
+Stripe Webhook Event
+       ↓
+WebhookController 接收 + 签名验证
+       ↓
+对应 EventService 处理
+       ↓
+memberRepository.linkSubscription()
+       ├── 更新数据库状态
+       ├── 记录 MemberPaidSubscriptionEvent
+       └── 分发 DomainEvents
+               ↓
+        各类订阅者处理
+               ├── StaffService → 员工通知邮件
+               ├── MemberRepository → 欢迎邮件
+               ├── VerificationTrigger → 验证触发
+               └── OfferRedemption → 优惠记录
+       ↓
+前端主动拉取 (sessionData) 或 URL 回调刷新
+```
+
+#### 6.1.2 事件级详细映射表
+
+| Stripe Webhook 事件 | 触发场景 | Ghost Domain Events | 会员通知 | Admin 通知 | 前端可见反馈 |
+|---------------------|---------|--------------------|----------|------------|-------------|
+| **checkout.session.completed** | 新订阅/升级/礼品购买 | `MemberCreatedEvent` (新会员) → `SubscriptionCreatedEvent` → `SubscriptionActivatedEvent` (如 active) → `OfferRedemptionEvent` (如有优惠) | 1. 欢迎邮件自动化 (paid welcome)<br>2. 或 Magic Link 登录邮件 | 1. `notifyFreeMemberSignup` (free)<br>2. `notifyPaidSubscriptionStarted` (paid) | Portal: `?stripe=success` → "Success!" 通知 → 关闭时刷新会员数据 |
+| **customer.subscription.created** | Stripe 创建订阅记录 | `SubscriptionCreatedEvent` → `SubscriptionActivatedEvent` (如 active) | 无 (checkout 场景已处理) | 同 activated 时 | 无直接反馈 (依赖 checkout 回调或主动刷新) |
+| **customer.subscription.updated** (状态: incomplete→active) | 3D Secure 验证完成 | `SubscriptionActivatedEvent` | 欢迎邮件 (如之前未发送) | `notifyPaidSubscriptionStarted` | 无直接反馈 (需刷新页面) |
+| **customer.subscription.updated** (状态: active→past_due) | 首次扣款失败 | 无 DomainEvent (仅更新状态为 unpaid) | 无 | 无 | Portal: 仍显示 paid，但状态可能异常 |
+| **customer.subscription.updated** (cancel_at_period_end=true) | 用户在 Portal 或 Stripe 取消 | `SubscriptionCancelledEvent` (cancelNow=false) | 无 | `notifyPaidSubscriptionCanceled` (到期取消) | Portal: 显示 "Renew subscription" 按钮，显示到期日期 |
+| **customer.subscription.updated** (状态: canceled→active) | 到期前恢复订阅 | `SubscriptionActivatedEvent` | 无 | 无 | Portal: "Renew subscription" 按钮变回 "Cancel subscription" |
+| **customer.subscription.deleted** | 立即取消 (退款/管理员操作) | `SubscriptionCancelledEvent` (cancelNow=true) | 无 | `notifyPaidSubscriptionCanceled` (立即取消) | Portal: 状态变为 free，显示升级选项 |
+| **invoice.payment_succeeded** | 周期性扣款成功 | 无 (仅记录 payment) | 无 | 无 | 无直接反馈 |
+| **charge.refunded** | 退款处理 | 无 | 无 | 无 | 无直接反馈 |
+
+#### 6.1.3 MemberPaidSubscriptionEvent 数据库记录
+
+每次订阅状态变更都会在 `members_paid_subscription_events` 表记录一行：
+
+| 字段 | 说明 | 示例值 |
+|-----|------|-------|
+| `source` | 事件来源 | `stripe` |
+| `type` | 事件类型 | `created` / `updated` / `reactivated` / `active` / `canceled` / `expired` |
+| `from_plan` | 变更前价格 ID | `price_xxx` (null 表示新建) |
+| `to_plan` | 变更后价格 ID | `price_xxx` (null 表示取消) |
+| `currency` | 货币 | `usd` |
+| `mrr_delta` | MRR 变化量 | `999` (月收入增加 ¥9.99) |
+| `created_at` | 事件时间 | `2026-05-10 10:00:00` |
+
+**type 字段映射** (`member-repository.js:1254-1264`)：
+```javascript
+const getEventType = (originalStatus, updatedStatus) => {
+    if (originalStatus === updatedStatus) return 'updated';      // 价格/优惠变更
+    if (originalStatus === 'canceled' && updatedStatus === 'active') return 'reactivated';  // 恢复订阅
+    return updatedStatus;  // active / canceled / expired
+};
+```
+
+### 6.2 乱序事件场景分析
+
+Stripe webhook 不保证按顺序到达，以下是常见乱序场景及用户可见影响：
+
+#### 6.2.1 场景 1: subscription.updated 先于 checkout.session.completed
+
+**时间轴**：
+```
+T0: 用户完成 Stripe checkout
+T1: subscription.updated (status=active) 到达 → 但会员还未创建
+T2: checkout.session.completed 到达 → 创建会员 + 关联订阅
+```
+
+**可能偏差**：
+- T1 时：`memberRepository.getByCustomerId()` 返回 `null` → 事件被忽略
+- T2 时：checkout 处理流程正常执行 → 最终状态正确
+- **用户感知**：无偏差，checkout 事件通常先到达
+
+**风险等级**：低 (checkout 事件通常先到达)
+
+#### 6.2.2 场景 2: subscription.created 与 subscription.updated 并发
+
+**时间轴**：
+```
+T0: 两个事件并发到达
+    Thread A: subscription.created → 开始 linkSubscription
+    Thread B: subscription.updated → 开始 linkSubscription
+```
+
+**可能偏差**：
+- 事务 + 行级锁 (`forUpdate: true`) → 其中一个等待
+- 先完成的执行 insert，后完成的执行 update
+- **用户感知**：无偏差，事务保证原子性
+
+**风险等级**：极低 (数据库锁保护)
+
+#### 6.2.3 场景 3: subscription.deleted 先于 canceled 状态更新
+
+**时间轴**：
+```
+T0: 用户立即取消订阅 (退款)
+T1: subscription.updated (status=canceled) 到达
+T2: subscription.deleted 到达 (有时差)
+```
+
+**可能偏差**：
+- T1: 状态变为 `canceled` (cancel_at_period_end=true)
+- T2: 状态变为 `expired` (cancelNow=true)
+- **用户感知**：可能短暂看到"已取消但在期限内"，然后变为"已过期"
+- **Admin 通知**：可能收到两封取消邮件？
+
+**代码检查**：
+```javascript
+// member-repository.js:1304
+if (this.isActiveSubscriptionStatus(originalStatus) && 
+    (updatedStatus === 'canceled' || updatedStatus === 'expired')) {
+    // 发送取消通知
+}
+```
+
+- 如果 originalStatus 在 T2 时已不是 active (T1 已改为 canceled)
+- **则 T2 不会再次发送通知**
+
+**风险等级**：低 (状态检查过滤重复通知)
+
+#### 6.2.4 场景 4: 3D Secure 场景 - updated 与 checkout 乱序
+
+**时间轴**：
+```
+T0: 用户开始 checkout → 跳转 Stripe
+T1: Stripe 创建 subscription (status=incomplete)
+T2: subscription.created 到达 → 记录但 status 非 active
+T3: 用户完成 3D Secure
+T4: checkout.session.completed 到达
+T5: subscription.updated (incomplete→active) 到达
+```
+
+**可能偏差**：
+- **正常顺序** T4 → T5：
+  - T4: checkout 处理，subscription 已 active → 发送激活通知
+  - T5: updated 处理，originalStatus=active → 不重复发送
+
+- **乱序 T5 → T4**：
+  - T5: subscription.updated，会员还不存在 → 被忽略
+  - T4: checkout 处理，subscription 已 active → 发送激活通知
+- **用户感知**：无偏差
+
+**风险等级**：低 (checkout 事件兜底)
+
+### 6.3 重复事件场景分析
+
+Stripe 保证至少一次 (at-least-once) 投递，事件可能重复。
+
+#### 6.3.1 重复 checkout.session.completed
+
+**保护机制**：
+```javascript
+// member-repository.js:925-960 - createSubscription
+// 对 StripeCustomer 执行 upsert
+await this.upsertCustomer({
+    customer_id: customer.id,
+    member_id: member.id,
+    ...
+});
+
+// 对 subscription 也会有唯一约束保护
+// subscription-event-service.js:40-51
+try {
+    await memberRepository.linkSubscription({...});
+} catch (err) {
+    if (err.code !== 'ER_DUP_ENTRY' && err.code !== 'SQLITE_CONSTRAINT') {
+        throw err;
+    }
+    throw new errors.ConflictError({err});  // Webhook 返回 409，但 Stripe 忽略
+}
+```
+
+**可能偏差**：
+- 数据库层：无重复数据 (唯一约束 + upsert)
+- 通知层：可能重复发送邮件！
+  - `SubscriptionCreatedEvent` / `SubscriptionActivatedEvent` 可能被多次分发
+  - StaffService 收到多次 → 多封通知邮件
+  - 欢迎邮件可能重复入队
+
+**用户感知**：
+- 员工收到多封通知邮件
+- 会员可能收到多封欢迎邮件/登录邮件
+
+**风险等级**：中 (邮件可能重复)
+
+**Offer 赎回保护** (有专门去重)：
+```javascript
+// member-repository.js:113-133
+DomainEvents.subscribe(OfferRedemptionEvent, async function (event) {
+    const existingRedemption = await OfferRedemption.findOne({
+        member_id: event.data.memberId,
+        subscription_id: event.data.subscriptionId,
+        offer_id: event.data.offerId
+    });
+    if (!existingRedemption) {
+        await OfferRedemption.add({...});
+    }
+});
+```
+
+#### 6.3.2 重复 subscription.updated
+
+**保护机制**：
+```javascript
+// member-repository.js:1250-1281
+// 只有当 MRR、plan_id、status、cancel_at_period_end 变化时才记录事件
+if (stripeCustomerSubscriptionModel.get('mrr') !== updated... ||
+    stripeCustomerSubscriptionModel.get('plan_id') !== updated... ||
+    stripeCustomerSubscriptionModel.get('status') !== updated... ||
+    stripeCustomerSubscriptionModel.get('cancel_at_period_end') !== updated...) {
+    
+    // 记录 MemberPaidSubscriptionEvent
+    // 分发 DomainEvents
+}
+```
+
+**可能偏差**：
+- 第一次处理：状态已更新，事件已分发
+- 第二次处理：状态对比发现无变化 → 跳过
+- **通知层**：可能在第二次处理时不重复发送，但第一次可能重复？
+
+**风险等级**：低 (状态对比过滤)
+
+#### 6.3.3 重复 invoice.payment_succeeded
+
+**保护机制**：
+```javascript
+// invoice-event-service.js:27-69
+// 简单的 insert，无去重
+await eventRepository.registerPayment({
+    member_id: member.id,
+    currency: invoice.currency,
+    amount: invoice.amount_paid
+});
+```
+
+**可能偏差**：
+- 同一发票可能记录多条 payment 记录
+- MRR 统计不受影响 (不重复计算)
+- 但 `members_payments` 表有重复数据
+
+**风险等级**：低 (数据冗余但功能正常)
+
+### 6.4 延迟场景的用户可见状态偏差
+
+当 Stripe webhook 因网络问题延迟时，前端可能看到不一致状态。
+
+#### 6.4.1 新订阅延迟
+
+**用户操作时间轴**：
+```
+T0: 用户点击 "Subscribe" → 跳转 Stripe
+T1: 用户完成支付 → Stripe 返回 successUrl
+T2: 用户回到 Ghost → 看到 "Success!" 通知
+T3: 用户打开 Portal
+    ⚠️ Webhook 延迟到达
+    → 后端 member.status 仍是 'free'
+    → Portal 显示免费账户 UI
+T4: 用户关闭通知 → refreshMemberData()
+    → 后端可能仍未处理 → 还是 free
+T5: 5 分钟后 Webhook 到达 → member.status = 'paid'
+T6: 用户刷新页面 → 正常显示 paid
+```
+
+**用户感知偏差**：
+| 时间点 | 预期状态 | 实际显示 | 用户操作 |
+|-------|---------|---------|---------|
+| T2-T3 | paid | free 或部分 paid | 困惑：支付成功但仍显示免费 |
+| T4 | paid | free | 刷新无效 |
+| T6 | paid | paid | 恢复正常 |
+
+**可能的用户投诉**：
+> "我已经付费了，但账户还是免费的！"
+
+**兜底机制**：
+- Stripe 会重试 webhook (最多几天)
+- 用户刷新页面最终会看到正确状态
+- 但用户体验差
+
+#### 6.4.2 取消订阅延迟
+
+**用户操作时间轴**：
+```
+T0: 用户在 Portal 点击 "Cancel subscription"
+T1: API 调用 Stripe 取消 → 立即返回成功
+T2: 本地调用 sessionData() → 状态已更新
+T3: 弹窗关闭 → reloadOnPopupClose → 页面刷新
+    ⚠️ Stripe webhook 延迟
+T4: 用户看到已取消状态 (本地状态已更新)
+T5: 几分钟后 Webhook 到达 → 确认更新
+```
+
+**关键差异**：
+- **用户发起的操作**：本地先更新，再等 webhook
+- **Stripe 发起的状态变更**：完全依赖 webhook
+
+**用户感知**：无偏差 (本地状态优先)
+
+#### 6.4.3 付款失败 (past_due)
+
+**场景**：
+```
+T0: 自动扣款失败 → subscription.status = past_due
+T1: Stripe 发送 webhook → Ghost 收到，更新状态
+T2: 用户访问 Portal
+    → isActiveSubscriptionStatus() 仍认为 active
+    → 显示正常付费 UI
+    → 但 MRR = 0
+```
+
+**状态判断逻辑** (`member-repository.js:164-166`)：
+```javascript
+isActiveSubscriptionStatus(status) {
+    return ['active', 'trialing', 'unpaid', 'past_due'].includes(status);
+}
+```
+
+**用户感知偏差**：
+- Portal 仍显示"付费会员"
+- 但实际上付款已失败
+- 用户可能不知道需要更新支付方式
+
+**风险等级**：中 (用户无感知)
+
+### 6.5 排查观测点指南
+
+当出现状态不一致时，按以下顺序排查：
+
+#### 6.5.1 第一级：Webhook 接收状态
+
+**检查点**：
+1. **Stripe Dashboard** → Developers → Webhooks
+   - 查看 webhook endpoint 状态
+   - 查看失败重试列表
+   - 检查 event 时间戳
+
+2. **Ghost 日志** (应用日志)
+   ```
+   搜索: "stripe webhook" 或 "WebhookController"
+   
+   正常日志:
+   - "Handling Stripe webhook event: checkout.session.completed"
+   
+   异常日志:
+   - "Failed to parse Stripe webhook" (签名错误)
+   - "ConflictError" (重复事件)
+   - "No member found for Stripe customer" (乱序事件被忽略)
+   ```
+
+3. **数据库: members_stripe_webhook_events**
+   - 记录所有收到的 webhook 事件
+   - 可与 Stripe Dashboard 对比
+   - 检查 `created_at` 时间顺序
+
+#### 6.5.2 第二级：状态同步状态
+
+**检查点**：
+1. **Stripe API 直连确认**
+   ```javascript
+   // Stripe Dashboard 或 CLI
+   stripe subscriptions retrieve sub_xxx
+   → 确认 Stripe 端真实状态
+   ```
+
+2. **Ghost 数据库对比**
+   ```sql
+   -- 对比会员状态
+   SELECT id, email, status 
+   FROM members 
+   WHERE id = 'member_xxx';
+   
+   -- 对比订阅状态
+   SELECT id, status, cancel_at_period_end, current_period_end
+   FROM members_stripe_customers_subscriptions
+   WHERE member_id = 'member_xxx';
+   ```
+
+3. **事件记录表**
+   ```sql
+   -- 查看订阅事件历史
+   SELECT type, from_plan, to_plan, mrr_delta, created_at
+   FROM members_paid_subscription_events
+   WHERE member_id = 'member_xxx'
+   ORDER BY created_at;
+   ```
+
+4. **Domain Events 分发**
+   ```
+   搜索日志: "DomainEvents.dispatch" 或事件名
+   
+   应看到:
+   - "SubscriptionActivatedEvent dispatched"
+   - "StaffService handled SubscriptionActivatedEvent"
+   ```
+
+#### 6.5.3 第三级：前端状态同步
+
+**检查点**：
+1. **Portal sessionData API**
+   ```
+   浏览器 DevTools → Network
+   找到: /members/api/session/
+   检查 Response: { member: { paid: true/false, status: "paid", subscriptions: [...] } }
+   ```
+
+2. **URL 参数**
+   ```
+   检查地址栏: ?stripe=success, ?stripe=cancel 等
+   验证: NotificationParser 是否正确解析
+   ```
+
+3. **React Query 缓存 (Admin)**
+   ```javascript
+   // DevTools → React Query 面板
+   检查 Query Key: ["MembersResponseType", "/members/"]
+   验证: 数据是否与数据库一致
+   检查: invalidateQueries 是否已触发
+   ```
+
+#### 6.5.4 第四级：通知状态
+
+**检查点**：
+1. **邮件队列**
+   ```sql
+   -- 检查邮件是否入队
+   SELECT * FROM emails 
+   WHERE member_id = 'member_xxx' 
+   ORDER BY created_at DESC;
+   ```
+
+2. **欢迎邮件自动化**
+   ```sql
+   -- 检查自动化运行
+   SELECT * FROM members_welcome_email_automation_runs
+   WHERE member_id = 'member_xxx';
+   ```
+
+3. **Mailpit (开发环境)**
+   ```
+   http://localhost:8025
+   搜索: 会员邮箱地址
+   ```
+
+#### 6.5.5 快速排查清单
+
+| 症状 | 优先排查点 |
+|-----|-----------|
+| 付费成功但 Portal 仍显示免费 | 1. Stripe Webhook 状态<br>2. `members_stripe_webhook_events` 表<br>3. `members.status` 字段 |
+| 收到多封通知邮件 | 1. 重复事件日志<br>2. `members_paid_subscription_events` 重复记录<br>3. `emails` 表重复条目 |
+| Admin 列表状态与详情不一致 | 1. React Query 缓存<br>2. Ember Bridge 事件同步<br>3. `emberDataChange` 事件触发 |
+| 取消后仍可访问付费内容 | 1. `members_stripe_customers_subscriptions.status`<br>2. `cancel_at_period_end` 字段<br>3. 主题层权限判断逻辑 |
+| 3D Secure 后状态未更新 | 1. `checkout.session.completed` 时间<br>2. `subscription.updated` 时间<br>3. 哪个先到达 |
+
+#### 6.5.6 关键 SQL 查询
+
+```sql
+-- 1. 查看某会员的完整订阅历史
+SELECT 
+    m.id, m.email, m.status,
+    s.id as subscription_id, s.status as sub_status, s.cancel_at_period_end,
+    e.type, e.from_plan, e.to_plan, e.mrr_delta, e.created_at
+FROM members m
+LEFT JOIN members_stripe_customers_subscriptions s ON m.id = s.member_id
+LEFT JOIN members_paid_subscription_events e ON s.id = e.subscription_id
+WHERE m.email = 'user@example.com'
+ORDER BY e.created_at DESC;
+
+-- 2. 查看最近的 webhook 事件
+SELECT 
+    type, 
+    created_at, 
+    data->'$.id' as event_id,
+    data->'$.data.object.id' as object_id
+FROM members_stripe_webhook_events
+WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+ORDER BY created_at DESC;
+
+-- 3. 查找状态不一致的会员
+SELECT m.id, m.email, m.status, s.status as subscription_status
+FROM members m
+JOIN members_stripe_customers_subscriptions s ON m.id = s.member_id
+WHERE 
+    (m.status = 'paid' AND s.status NOT IN ('active', 'trialing', 'unpaid', 'past_due'))
+    OR (m.status = 'free' AND s.status IN ('active', 'trialing'));
+
+-- 4. 查找重复的支付记录
+SELECT member_id, invoice_id, COUNT(*) as cnt
+FROM members_payments
+GROUP BY member_id, invoice_id
+HAVING cnt > 1;
+```
+
+## 7. 前端反馈协作与状态同步
 
 Stripe webhook 处理完成后，前端（Portal 和 Admin）需要感知会员状态变化并更新 UI。本节分析状态如何从后端同步到前端界面。
 
@@ -1096,7 +1599,9 @@ customer.subscription.deleted ─▶ linkSubscription() ──▶ paid → free 
 | 欢迎邮件 | `member-repository.js` | `enqueueWelcomeEmailRun()` |
 | 事件定义 | `shared/events/*.js` | 各类 Event 类 |
 
-## 8. 总结
+## 9. 总结
+
+### 9.1 后端同步特性
 
 Ghost 的 Stripe 订阅同步系统具有以下特点：
 
@@ -1105,5 +1610,34 @@ Ghost 的 Stripe 订阅同步系统具有以下特点：
 3. **状态一致**：事务提交后才分发事件，确保数据与通知一致
 4. **乱序兼容**：Stripe 事件可能乱序到达，upsert + 状态比较确保最终一致性
 5. **智能通知**：区分欢迎邮件、登录邮件、员工通知，避免重复打扰
+
+### 9.2 前端反馈协作特性
+
+前端状态同步采用**主动拉取 + 多层兜底**策略：
+
+1. **无实时推送**：Portal 和 Admin 都没有 WebSocket/SSE，完全依赖主动拉取
+2. **三层刷新机制**：
+   - 操作成功后立即调用 `sessionData()`
+   - URL 通知关闭时触发 `refreshMemberData`
+   - 复杂操作后 `reloadOnPopupClose` 强制页面刷新
+3. **统一错误处理**：所有异步操作都有 `:failed` 分支，错误提示不自动消失
+4. **用户友好的失败状态**：
+   - `autoHide: false` 确保用户看到错误
+   - `closeable: true` 允许用户手动关闭
+   - warning 状态区分主动取消与真实失败
+5. **Admin 数据同步**：通过 Ember Bridge + React Query 缓存失效实现 Ember→React 状态同步
+
+### 9.3 延迟场景的最终一致性
+
+当 Stripe webhook 延迟时，系统确保最终一致性：
+
+```
+用户视角（可能的体验）：
+1. 支付完成 → 看到 "Success!" 通知
+2. 打开 Portal → 可能还显示免费状态（webhook 未到）
+3. 关闭通知 → refreshMemberData() 主动拉取
+4. 若已同步 → 状态更新；若未同步 → 仍显示免费
+5. 用户刷新页面 → initSetup() 再次获取
+```
 
 这个设计确保了即使在网络不稳定、Stripe 重复推送、或并发处理场景下，会员状态依然能够正确同步。
