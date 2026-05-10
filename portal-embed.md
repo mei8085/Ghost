@@ -656,13 +656,14 @@ async getMemberDataFromSession(req, res) {
 
 Members API 是 Portal 获取和修改成员状态的**唯一可信通道**：
 
-| API 端点 | 方法 | 认证方式 | 功能 |
-|---------|------|---------|------|
-| `/members/api/member/ | GET | Cookie (`members-ssr`) | 获取当前登录成员 |
-| `/members/api/member/` | PUT | Cookie | 更新成员资料 |
-| `/members/api/member/signout/` | POST | Cookie | 清除会话 Cookie |
-| `/members/api/send-magic-link/` | POST | Integrity Token + CSRF | 发送登录 magic link |
-| `/members/api/identity/` | GET | Cookie | 获取身份 JWT（用于 iframe 跨域场景） |
+| API 端点 | 方法 | 认证方式 | 功能 | 源码依据 |
+|---------|------|---------|------|---------|
+| `/members/api/member/` | GET | Cookie (`members-ssr`) | 获取当前登录成员 | `ghost/core/core/server/web/members/app.js:59` |
+| `/members/api/member/` | PUT | Cookie | 更新成员资料 | `ghost/core/core/server/web/members/app.js:62` |
+| `/members/api/session/` | DELETE | Cookie | 清除会话 Cookie | `ghost/core/core/server/web/members/app.js:75` |
+| `/members/api/session/` | GET | Cookie | 获取身份 JWT | `ghost/core/core/server/web/members/app.js:74` |
+| `/members/api/send-magic-link/` | POST | Integrity Token + CSRF | 发送登录 magic link | `ghost/core/core/server/web/members/app.js:80-92` |
+| `/members/api/integrity-token/` | GET | 无 | 获取请求完整性 Token | `ghost/core/core/server/web/members/app.js:78` |
 
 **核心文件**：`ghost/core/core/server/services/members/middleware.js:243-255`
 
