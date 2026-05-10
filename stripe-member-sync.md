@@ -496,6 +496,316 @@ const getEventType = (originalStatus, updatedStatus) => {
 };
 ```
 
+#### 6.1.4 事件 → 观测点 → 定位动作 对照表
+
+本节为每个 Stripe 事件提供最小排查路径，包括日志关键字、数据库核对字段、前端可见症状，以及 Portal 与 Admin 的反馈差异。
+
+**核心排查原则**：
+1. **日志先行**：先确认事件是否被接收和处理
+2. **数据库核对**：确认状态是否正确持久化
+3. **前端症状**：区分 Portal（会员视角）与 Admin（运营视角）的差异
+4. **定位动作**：给出可直接执行的检查步骤
+
+---
+
+**对照表总览**：
+
+| Stripe Webhook 事件 | 日志关键字 | 数据库核对字段 | Portal 可见症状 | Admin 可见症状 | 最小定位动作 |
+|---------------------|-----------|---------------|----------------|----------------|-------------|
+| **checkout.session.completed** | `Handling webhook checkout.session.completed` | `members.status` = 'paid'<br>`members_stripe_customers_subscriptions.status` = 'active' | ✅ 显示"Success!"通知<br>✅ 关闭后刷新会员数据<br>✅ `?stripe=success` URL 参数 | ✅ 收到 `notifyPaidSubscriptionStarted` 邮件<br>✅ 会员列表状态变为 Paid | 1. 查日志确认 webhook 到达<br>2. 查 `members_paid_subscription_events.type` = 'created'<br>3. 查 `members.status` |
+| **customer.subscription.created** | `Handling webhook customer.subscription.created` | `members_stripe_customers_subscriptions` 新增记录 | ❌ 无直接反馈（依赖 checkout 回调） | ✅ 如状态为 active，收到激活通知 | 1. 查日志确认 webhook 到达<br>2. 查订阅表是否新增记录 |
+| **customer.subscription.updated** (incomplete→active) | `Handling webhook customer.subscription.updated` | `members_stripe_customers_subscriptions.status` 从 'incomplete' → 'active' | ❌ 无直接反馈（需刷新页面） | ✅ 收到 `notifyPaidSubscriptionStarted` 邮件 | 1. 查日志确认 webhook 到达<br>2. 查 `members_paid_subscription_events.type` = 'active'<br>3. 对比前后 `status` 变化 |
+| **customer.subscription.updated** (active→past_due) | `Handling webhook customer.subscription.updated` | `members_stripe_customers_subscriptions.status` = 'past_due'<br>`mrr` = 0 | ⚠️ 仍显示 Paid 状态<br>⚠️ `isActiveSubscriptionStatus()` 仍返回 true | ❌ 无邮件通知<br>⚠️ 会员列表仍显示 Paid | 1. 查日志确认 webhook 到达<br>2. 查订阅表 `status` 和 `mrr` 字段<br>3. 注意：前端可能无感知 |
+| **customer.subscription.updated** (cancel_at_period_end=true) | `Handling webhook customer.subscription.updated` | `members_stripe_customers_subscriptions.cancel_at_period_end` = true | ✅ 显示"Renew subscription"按钮<br>✅ 显示到期日期 | ✅ 收到 `notifyPaidSubscriptionCanceled` 邮件（到期取消）<br>✅ 会员列表显示 Canceling | 1. 查日志确认 webhook 到达<br>2. 查 `cancel_at_period_end` 字段<br>3. 查 `members_paid_subscription_events.type` = 'canceled' |
+| **customer.subscription.updated** (canceled→active) | `Handling webhook customer.subscription.updated` | `members_stripe_customers_subscriptions.cancel_at_period_end` = false<br>`status` = 'active' | ✅ "Renew subscription" 按钮消失<br>✅ 恢复正常付费 UI | ❌ 无邮件通知<br>✅ 会员列表状态恢复 Paid | 1. 查日志确认 webhook 到达<br>2. 查 `members_paid_subscription_events.type` = 'reactivated' |
+| **customer.subscription.deleted** | `Handling webhook customer.subscription.deleted` | `members_stripe_customers_subscriptions.status` = 'deleted' 或记录被移除<br>`members.status` = 'free' | ✅ 状态变为 Free<br>✅ 显示升级选项 | ✅ 收到 `notifyPaidSubscriptionCanceled` 邮件（立即取消）<br>✅ 会员列表显示 Canceled | 1. 查日志确认 webhook 到达<br>2. 查 `members.status` = 'free'<br>3. 查 `members_paid_subscription_events.type` = 'expired' |
+| **invoice.payment_succeeded** | `Handling webhook invoice.payment_succeeded` | `members_payments` 新增记录 | ❌ 无直接反馈 | ❌ 无邮件通知 | 1. 查日志确认 webhook 到达<br>2. 查 `members_payments` 表是否有记录 |
+| **charge.refunded** | `Handling webhook charge.refunded` | 无直接字段更新（需业务逻辑处理） | ❌ 无直接反馈 | ❌ 无邮件通知 | 1. 查日志确认 webhook 到达<br>2. 需手动核对 Stripe Dashboard |
+
+---
+
+#### 6.1.5 Portal 与 Admin 前端反馈差异对照表
+
+**设计差异根源**：
+- **Portal**：面向付费会员，关注"我有什么权限"、"我的订阅状态"
+- **Admin**：面向运营人员，关注"谁订阅了"、"收入多少"、"是否需要跟进"
+
+| 场景 | Portal 反馈（会员视角） | Admin 反馈（运营视角） | 差异原因 |
+|-----|------------------------|----------------------|---------|
+| **新订阅成功** | ✅ "Success!" 通知（3秒自动消失）<br>✅ 关闭后自动刷新会员数据<br>✅ 登录后显示"Welcome, {name}!" | ✅ 邮件通知："New paid subscription"<br>✅ 会员列表：状态从 Free → Paid<br>✅ 仪表盘：MRR 增加 | Portal：即时视觉反馈 + 数据刷新<br>Admin：邮件 + 数据列表更新 |
+| **订阅取消（到期取消）** | ✅ "Renew subscription" 按钮<br>✅ 显示到期日期<br>✅ 仍可访问付费内容 | ✅ 邮件通知："Paid subscription canceled"<br>✅ 会员列表：状态 "Canceling"<br>✅ 仪表盘：预期 MRR 下降 | Portal：强调"还能继续用，要续费吗？"<br>Admin：强调"有流失风险，需要跟进" |
+| **订阅取消（立即取消）** | ✅ 状态变为 Free<br>✅ 无法访问付费内容<br>✅ 显示"Upgrade"按钮 | ✅ 邮件通知："Paid subscription canceled (immediate)"<br>✅ 会员列表：状态 "Canceled"<br>✅ 仪表盘：MRR 立即下降 | Portal：即时权限降级<br>Admin：明确区分到期取消 vs 立即取消 |
+| **付款失败 (past_due)** | ⚠️ 仍显示 Paid 状态<br>⚠️ 无任何提示<br>⚠️ 仍可访问付费内容 | ❌ 无邮件通知<br>⚠️ 会员列表仍显示 Paid<br>⚠️ 仪表盘 MRR 已下降 (mrr=0) | **⚠️ 风险点**：双方都无感知<br>Portal：`isActiveSubscriptionStatus()` 包含 past_due<br>Admin：依赖外部支付失败提醒 |
+| **恢复订阅** | ✅ "Renew subscription" 按钮消失<br>✅ 恢复正常付费 UI | ❌ 无邮件通知<br>✅ 会员列表恢复 Paid 状态 | Portal：即时 UI 变化<br>Admin：无主动通知，需查看列表 |
+| **价格变更/优惠变更** | ✅ 显示新价格信息<br>✅ 显示优惠码（如有） | ❌ 无邮件通知<br>✅ 会员详情显示新价格 | Portal：关注"我付多少钱"<br>Admin：关注"收入变化"（MRR delta 记录） |
+
+---
+
+#### 6.1.6 每个事件的最小排查路径（详细版）
+
+**排查路径格式**：
+```
+日志确认 → 数据库核对 → 前端验证 → 定位动作
+```
+
+**事件 1: checkout.session.completed**
+
+```
+日志确认:
+  搜索: "Handling webhook checkout.session.completed"
+  正常: 日志存在，无 Error 级别日志
+  异常:
+    - 找不到日志 → webhook 未到达或被忽略（检查 ignore list）
+    - "ConflictError" → 重复事件（数据库唯一约束）
+    - "No member found" → 乱序事件（subscription.updated 先到）
+
+数据库核对:
+  1. SELECT * FROM members_stripe_webhook_events 
+     WHERE type = 'checkout.session.completed'
+     ORDER BY created_at DESC LIMIT 1;
+  2. SELECT id, email, status FROM members 
+     WHERE email = '{会员邮箱}';
+     → 期望: status = 'paid'
+  3. SELECT id, status, cancel_at_period_end 
+     FROM members_stripe_customers_subscriptions
+     WHERE member_id = '{会员ID}';
+     → 期望: status = 'active'
+  4. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'created'
+
+前端验证 (Portal):
+  - 地址栏有 ?stripe=success 参数
+  - 显示 "Success! Your account is fully activated..."
+  - 关闭通知后刷新，member.paid = true
+  - 显示当前订阅价格
+
+前端验证 (Admin):
+  - 邮件：收到 "New paid subscription from {email}"
+  - 会员列表：状态 = Paid
+  - 会员详情：显示订阅信息
+
+定位动作:
+  1. 查 Stripe Dashboard → Webhooks → 确认事件已发送
+  2. 查 Ghost 日志 → 确认事件被接收
+  3. 查数据库 → 确认状态已更新
+  4. 查 Domain Events → 确认邮件已发送
+```
+
+**事件 2: customer.subscription.updated (cancel_at_period_end=true)**
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.updated"
+  正常: 日志存在
+  异常: "No member found for Stripe customer" → 会员未关联
+
+数据库核对:
+  1. SELECT id, status, cancel_at_period_end, current_period_end
+     FROM members_stripe_customers_subscriptions
+     WHERE member_id = '{会员ID}';
+     → 期望: cancel_at_period_end = 1
+  2. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'canceled'
+  3. SELECT id, email, status FROM members 
+     WHERE id = '{会员ID}';
+     → 期望: status = 'paid' (注意：仍为 paid，只是 cancel_at_period_end)
+
+前端验证 (Portal):
+  - 显示 "Your subscription will end on {日期}"
+  - "Cancel subscription" 按钮变为 "Renew subscription"
+  - 仍可访问付费内容
+
+前端验证 (Admin):
+  - 邮件：收到 "Paid subscription canceled"
+  - 会员列表：状态 = Canceling
+  - 会员详情：显示 "Expires on {日期}"
+
+定位动作:
+  1. 查日志确认 webhook 到达
+  2. 查 cancel_at_period_end 字段
+  3. 查 cancel_now 参数（区分立即取消 vs 到期取消）
+  4. 确认取消来源（Portal 操作 vs Stripe Dashboard 操作）
+```
+
+**事件 3: customer.subscription.deleted（立即取消）**
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.deleted"
+
+数据库核对:
+  1. SELECT id, email, status FROM members 
+     WHERE id = '{会员ID}';
+     → 期望: status = 'free'
+  2. SELECT id, status FROM members_stripe_customers_subscriptions
+     WHERE member_id = '{会员ID}';
+     → 期望: 记录不存在 或 status = 'deleted'
+  3. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'expired'
+
+前端验证 (Portal):
+  - 状态变为 Free
+  - 无法访问付费内容（返回 403 或重定向）
+  - 显示 "Upgrade" 按钮
+
+前端验证 (Admin):
+  - 邮件：收到 "Paid subscription canceled (immediate)"
+  - 会员列表：状态 = Canceled
+  - 仪表盘：MRR 立即下降
+
+定位动作:
+  1. 确认是立即取消（cancel_now = true）还是到期取消
+  2. 查 members.status 是否已变为 free
+  3. 确认 MRR 计算正确（mrr_delta 应为负数）
+  4. 确认取消原因（退款？欺诈？管理员操作？）
+```
+
+**事件 4: customer.subscription.updated (active→past_due)**
+
+```
+日志确认:
+  搜索: "Handling webhook customer.subscription.updated"
+  → 注意：无错误日志，无 DomainEvent 分发
+
+数据库核对:
+  1. SELECT id, status, mrr FROM members_stripe_customers_subscriptions
+     WHERE member_id = '{会员ID}';
+     → 期望: status = 'past_due', mrr = 0
+  2. SELECT id, email, status FROM members 
+     WHERE id = '{会员ID}';
+     → 期望: status = 'paid' (⚠️ 注意：仍为 paid！)
+  3. SELECT type, from_plan, to_plan, mrr_delta 
+     FROM members_paid_subscription_events
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: type = 'past_due', mrr_delta = -{原金额}
+
+前端验证 (Portal):
+  ⚠️ 仍显示 Paid 状态
+  ⚠️ 无任何提示
+  ⚠️ 仍可访问付费内容
+  ⚠️ isActiveSubscriptionStatus() 返回 true
+
+前端验证 (Admin):
+  ❌ 无邮件通知
+  ⚠️ 会员列表仍显示 Paid
+  ⚠️ 但仪表盘 MRR 已下降
+
+定位动作:
+  1. ⚠️ 这是高风险场景：前后端都无感知
+  2. 查订阅表 mrr 字段（应为 0）
+  3. 查 Stripe Dashboard → 是否有付款失败提醒
+  4. 建议：建立付款失败的主动提醒机制
+  5. 查 members_paid_subscription_events.mrr_delta
+```
+
+**事件 5: invoice.payment_succeeded**
+
+```
+日志确认:
+  搜索: "Handling webhook invoice.payment_succeeded"
+
+数据库核对:
+  1. SELECT * FROM members_payments 
+     WHERE member_id = '{会员ID}'
+     ORDER BY created_at DESC LIMIT 1;
+     → 期望: 新增记录，amount = invoice.amount_paid
+
+前端验证 (Portal):
+  ❌ 无直接反馈
+
+前端验证 (Admin):
+  ❌ 无邮件通知
+  ✅ 会员详情显示最新付款记录
+
+定位动作:
+  1. 查 members_payments 表是否有记录
+  2. 查 invoice.paid 和 invoice.amount_paid 字段
+  3. 确认金额和币种正确
+  4. 对于订阅场景：此事件通常伴随 subscription.updated
+```
+
+---
+
+#### 6.1.7 快速排查命令汇总
+
+**日志排查**：
+```bash
+# 查看最近 1 小时的 Stripe webhook 日志
+grep -i "stripe webhook\|Handling webhook\|checkout.session\|subscription\|invoice" logs/*.log | head -50
+
+# 查看特定事件类型
+grep "Handling webhook checkout.session.completed" logs/*.log
+
+# 查看错误日志
+grep -i "error\|failed\|conflict" logs/*.log | grep -i stripe
+```
+
+**数据库排查**：
+```sql
+-- 1. 查看最近的 webhook 事件
+SELECT type, created_at, 
+       data->'$.data.object.id' as object_id,
+       data->'$.data.object.customer' as customer_id
+FROM members_stripe_webhook_events
+WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+ORDER BY created_at DESC;
+
+-- 2. 查看某会员的完整状态
+SELECT 
+    m.id, m.email, m.status as member_status,
+    s.id as sub_id, s.status as sub_status, 
+    s.cancel_at_period_end, s.mrr,
+    e.type as last_event_type, e.mrr_delta
+FROM members m
+LEFT JOIN members_stripe_customers_subscriptions s ON m.id = s.member_id
+LEFT JOIN members_paid_subscription_events e ON s.id = e.subscription_id
+WHERE m.email = '{会员邮箱}'
+ORDER BY e.created_at DESC
+LIMIT 5;
+
+-- 3. 查找状态不一致的会员
+SELECT m.id, m.email, m.status, 
+       s.status as sub_status, s.mrr
+FROM members m
+JOIN members_stripe_customers_subscriptions s ON m.id = s.member_id
+WHERE 
+    (m.status = 'paid' AND s.status NOT IN ('active', 'trialing', 'unpaid', 'past_due'))
+    OR (m.status = 'free' AND s.status IN ('active', 'trialing'))
+    OR (s.status = 'past_due' AND s.mrr != 0);
+
+-- 4. 查看某会员的付款历史
+SELECT * FROM members_payments 
+WHERE member_id = '{会员ID}'
+ORDER BY created_at DESC;
+
+-- 5. 查看某会员的事件历史
+SELECT type, from_plan, to_plan, mrr_delta, created_at
+FROM members_paid_subscription_events
+WHERE member_id = '{会员ID}'
+ORDER BY created_at DESC;
+```
+
+**API 验证**：
+```bash
+# 验证 Portal sessionData API
+curl -H "Cookie: ghost-members-ssr={cookie}" \
+     http://localhost:2368/members/api/session/
+
+# 验证 Admin 会员 API
+curl -H "Authorization: GhostSession {token}" \
+     http://localhost:2368/ghost/api/admin/members/{member_id}/
+```
+
 ### 6.2 乱序事件场景分析
 
 Stripe webhook 不保证按顺序到达，以下是常见乱序场景及用户可见影响：
@@ -1553,7 +1863,7 @@ T4  用户主动刷新 / 重新打开 Portal
   └──────────────────────┘                    └──────────────────────┘
 ```
 
-### 6.2 状态变更时序
+### 8.2 状态变更时序
 
 ```
 Stripe 事件                    Ghost 处理                        会员状态                  通知
