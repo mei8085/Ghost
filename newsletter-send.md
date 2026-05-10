@@ -1013,9 +1013,7 @@ async handleTemporaryFailed(event) {
 }
 ```
 
-**设计原因**：
-- **Permanent**：邮箱不存在、域名不存在等致命错误 → 计入失败率
-- **Temporary**：收件箱满、连接超时、灰名单等临时错误 → Mailgun 会自动重试，不计入本地失败统计
+**代码口径统计依据**：
 
 #### 5.7.4 统计聚合逻辑
 
@@ -1049,35 +1047,174 @@ async aggregateEmailStats(emailId, updateOpenedCount) {
 }
 ```
 
-#### 5.7.5 失败重试截止判断
+#### 5.7.5 发送阶段重试截止：_retryCutOffTime 作用范围
 
-邮件发送阶段的重试与邮件投递后的失败是两个不同概念：
+**代码对账结论**：`_retryCutOffTime` **只影响发送阶段的数据库操作重试**，不影响 Mailgun API 调用重试，也不影响投递后失败处理。
 
-**发送阶段重试**（BatchSendingService）：
 ```javascript
 // batch-sending-service.js:151-158
-// 计算重试截止时间
+// 在 emailJob() 开始时计算截止时间
+const startTime = Date.now();
 const expectedBatchCount = Math.ceil(email.get('email_count') / 1000);
-const minimumSecondsPerBatch = 26;  // 每批预估最低耗时
+const minimumSecondsPerBatch = 26; // 每批预估最低耗时
 const stopAfter = Math.max(
     expectedBatchCount * minimumSecondsPerBatch * 1000,
     this.#BEFORE_RETRY_CONFIG.maxTime  // 至少 10 分钟
 );
 email._retryCutOffTime = new Date(startTime + stopAfter);
+```
 
-// 在重试配置中应用截止时间
-#getBeforeRetryConfig(email) {
-    if (email._retryCutOffTime) {
-        return {...this.#BEFORE_RETRY_CONFIG, stopAfterDate: email._retryCutOffTime};
+**三层重试配置，各有独立策略**：
+
+| 重试配置 | 作用范围 | 使用 _retryCutOffTime | 默认参数 | 代码位置 |
+|----------|----------|------------------------|----------|----------|
+| `#BEFORE_RETRY_CONFIG` | 发送前 DB 操作 | **✓ 是** | `maxRetries:10, maxTime:10min, sleep:2s` | batch-sending-service.js:37 |
+| `#AFTER_RETRY_CONFIG` | 发送后 DB 状态持久化 | **✗ 否** | `maxRetries:20, maxTime:30min, sleep:2s` | batch-sending-service.js:38 |
+| `#MAILGUN_API_RETRY_CONFIG` | Mailgun API 调用 | **✗ 否** | `maxRetries:6, sleep:10s` | batch-sending-service.js:39 |
+
+**`_retryCutOffTime` 实际影响的操作**：
+
+```javascript
+// 只在以下 4 处调用 #getBeforeRetryConfig(email)，注入 stopAfterDate
+
+// 1. 加载关联关系
+const newsletter = await this.retryDb(async () => {
+    return await email.getLazyRelation('newsletter', {require: true});
+}, {...this.#getBeforeRetryConfig(email), description: `getLazyRelation newsletter...`});
+
+// 2. 加载 post
+const post = await this.retryDb(async () => {
+    return await email.getLazyRelation('post', {require: true, ...});
+}, {...this.#getBeforeRetryConfig(email), ...});
+
+// 3. 获取批次
+let batches = await this.retryDb(async () => {
+    return await this.getBatches(email);
+}, {...this.#getBeforeRetryConfig(email), ...});
+
+// 4. 创建批次
+await this.retryDb(async () => {
+    await this.#models.EmailRecipient.add(recipients);
+}, {...this.#getBeforeRetryConfig(email), ...});
+```
+
+**不受 `_retryCutOffTime` 影响的操作**：
+
+```javascript
+// Mailgun API 调用 - 使用独立的 #MAILGUN_API_RETRY_CONFIG
+const response = await this.retryDb(async () => {
+    return await this.#sendingService.send({...}, {...});
+}, {...this.#MAILGUN_API_RETRY_CONFIG, ...});  // 无 stopAfterDate
+
+// 发送后状态持久化 - 使用独立的 #AFTER_RETRY_CONFIG
+await this.retryDb(async () => {
+    await batch.save({provider_id: messageId, status: 'submitted', ...});
+}, {...this.#AFTER_RETRY_CONFIG, ...});  // 无 stopAfterDate
+```
+
+**重试截止判断逻辑**：
+
+```javascript
+// batch-sending-service.js:675-728 - retryDb()
+async retryDb(func, options) {
+    if (options.maxTime !== undefined) {
+        const stopAfterDate = new Date(Date.now() + options.maxTime);
+        // 取 maxTime 和 stopAfterDate 中更早的一个
+        if (!options.stopAfterDate || stopAfterDate < options.stopAfterDate) {
+            options = {...options, stopAfterDate};
+        }
     }
-    return this.#BEFORE_RETRY_CONFIG;
+
+    // ... 执行 func ...
+
+    // 退出条件：达到 maxRetries 或超过 stopAfterDate
+    if (retryCount >= options.maxRetries 
+        || (options.stopAfterDate 
+            && (new Date(Date.now() + sleep)) > options.stopAfterDate)) {
+        throw e;  // 停止重试
+    }
 }
 ```
 
-**投递后失败**（Mailgun 处理）：
-- **Temporary Failed**：Mailgun 会自动重试（通常重试 8 小时，间隔递增）
-- **Permanent Failed**：Mailgun 停止重试，Ghost 计入 `failed_count`
-- Ghost 不主动重试已提交给 Mailgun 的邮件
+**结论**：
+- `_retryCutOffTime` 是发送前 DB 操作的**硬截止时间**
+- 超出后即使 `maxRetries` 未用完也会停止重试
+- Mailgun API 调用和发送后状态持久化**不受此截止时间影响**
+
+#### 5.7.6 投递后失败：Temporary 与 Permanent 的处理去向
+
+**两个层次的失败**：
+
+| 层次 | 失败类型 | 处理者 | 重试策略 |
+|------|----------|--------|----------|
+| **发送阶段** | API/DB 调用失败 | Ghost BatchSendingService | 指数退避重试，有截止时间 |
+| **投递阶段** | failed(permanent/temporary) | Mailgun ESP | 由 Mailgun 决定，Ghost 只记录结果 |
+
+**投递后失败处理逻辑**：
+
+```javascript
+// email-event-storage.js:88-112 - permanent
+async handlePermanentFailed(event) {
+    // 1. 设置 email_recipients.failed_at（计入统计）
+    await this.#db.knex('email_recipients')
+        .where('id', '=', event.emailRecipientId)
+        .whereNull('failed_at')
+        .update({failed_at: timestamp});
+    
+    // 2. 写入失败记录表（包含 event_id）
+    await this.saveFailure('permanent', event);
+}
+
+// email-event-storage.js:114-116 - temporary
+async handleTemporaryFailed(event) {
+    // 仅写入失败记录，不更新 failed_at（不计入统计）
+    await this.saveFailure('temporary', event);
+}
+```
+
+**Temporary Failed 的数据去向**：
+
+```javascript
+// email-event-storage.js:144-154 - 写入 email_recipient_failures
+await this.#models.EmailRecipientFailure.add({
+    email_id: event.emailId,
+    member_id: event.memberId,
+    email_recipient_id: event.emailRecipientId,
+    severity: 'temporary',  // 标记 severity
+    message: event.error.message,
+    code: event.error.code,
+    enhanced_code: event.error.enhancedCode,
+    failed_at: event.timestamp,
+    event_id: event.id  // 记录 Mailgun event.id
+});
+```
+
+**email_recipient_failures 状态转换**：
+
+```javascript
+// email-event-storage.js:156-174 - 更新现有失败记录
+if (existing.get('severity') === 'permanent') {
+    // permanent 是终态，不再更新
+    return;
+}
+
+if (existing.get('failed_at') > event.timestamp) {
+    // 乱序保护：只保留最晚的失败时间
+    return;
+}
+
+// 可升级：temporary → temporary（更新）或 temporary → permanent（升级）
+await existing.save({
+    severity,  // 可能从 'temporary' 升级为 'permanent'
+    message,
+    ...
+});
+```
+
+**结论**：
+- **Permanent Failed**：设置 `email_recipients.failed_at` → 计入 `emails.failed_count`，是终态
+- **Temporary Failed**：仅写入 `email_recipient_failures`，`failed_at = NULL` → 不计入统计，后续可能升级为 permanent
+- Ghost **不主动重试**已提交给 Mailgun 的邮件，Mailgun 会自动重试 temporary failure（重试策略由 Mailgun 配置决定）
 
 ### 5.8 EventProcessingResult 事件计数
 
