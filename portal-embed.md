@@ -769,26 +769,32 @@ const deleteSession = async function deleteSession(req, res) {
 class CacheManager {
     init(events, settingsCollection, calculatedFields, cacheStore, settingsOverrides) {
         this.settingsCache = cacheStore;
+        this.settingsOverrides = settingsOverrides;
         this.reset(events);
-        
+
         // 填充初始缓存
         if (settingsCollection && settingsCollection.models) {
             _.each(settingsCollection.models, this._updateSettingFromModel);
         }
-        
+
+        this.calculatedFields = Array.isArray(calculatedFields) ? calculatedFields : [];
+
         // 监听设置变更事件，自动更新缓存
         events.on('settings.edited', this._updateSettingFromModel);
         events.on('settings.added', this._updateSettingFromModel);
         events.on('settings.deleted', this._updateSettingFromModel);
-        
-        // 监听计算字段依赖
+
+        // 初始化并绑定计算字段
         this.calculatedFields.forEach((field) => {
+            this._updateCalculatedField(field)();
             field.dependents.forEach((dependent) => {
-                events.on(`settings.${dependent}.edited', this._updateCalculatedField(field));
+                events.on(`settings.${dependent}.edited`, this._updateCalculatedField(field));
             });
         });
+
+        return this.settingsCache;
     }
-    
+
     _updateSettingFromModel(settingModel) {
         debug('Auto updating', settingModel.get('key'));
         this.set(settingModel.get('key'), settingModel.toJSON());
@@ -889,11 +895,11 @@ Portal 运行时每次 `initSetup()` 都会：
 
 **答案**：取决于**数据来源渠道**：
 
-| 数据来源 | 修改后已打开页面是否实时？ | 触发条件 |
-|---------|----------------------|-----------|
-| `data-*` 属性（如 accent_color | ❌ 否 | 刷新页面 |
-| Content API `/settings/` 返回值 | ❌ 否 | 打开 Portal 弹窗/切换页面/刷新 |
-| Members API 成员状态 | ✓ 是（Cookie 认证，非设置） | 每次 API 调用 |
+| 数据来源 | 修改后已打开页面是否实时？ | 触发条件 | 源码依据 |
+|---------|----------------------|-----------|---------|
+| `data-*` 属性（如 `data-accent-color`） | ❌ 否 | 刷新页面 | `ghost/core/core/frontend/helpers/ghost_head.js:60-72` |
+| Content API `/ghost/api/content/settings/` | ❌ 否 | 刷新页面 / 打开新页面 | `apps/portal/src/app.js:411`（仅 `initSetup()` 调用一次） |
+| Members API 成员状态 | ✓ 是（非 Portal 设置） | 每次 API 调用 | `apps/portal/src/utils/api.js` |
 
 #### 6.5.2 生产环境详细时序
 
@@ -903,7 +909,7 @@ T0: 用户访问站点页面
     ▼
     Portal 初始化
     ├── getSiteData() 从 script 读取 data-* 属性（静态快照）
-    └── fetchApiData() 调用 Content API（此时获取最新设置
+    └── fetchApiData() 调用 Content API（此时获取最新设置）
     │
     └── 渲染 UI（基于当前设置快照）
 
@@ -918,7 +924,7 @@ T1: 管理员后台修改 portal_button_style = 'icon-and-text'
     │
     └── 新请求：
         ✓ 新页面渲染 {{ghost_head}} 用新值
-        ✓ /content/settings/ 返回新值
+        ✓ /ghost/api/content/settings/ 返回新值
     │
     ▼
     已打开页面（访客浏览器）：
@@ -945,8 +951,7 @@ T2: 用户操作触发：
         ▼
         Portal 仍为同一 React 实例
         ❌ data-* 未重新读取
-        ❌ initSetup() 不再执行
-        └── 仅在某些主题有 SPA 路由？不刷新页面
+        ❌ initSetup() 不再执行（componentDidMount 只运行一次）
 ```
 
 #### 6.5.3 触发已打开页面看到新设置需要满足的条件
@@ -957,60 +962,76 @@ T2: 用户操作触发：
 // 条件：window.location.reload()
 结果：
   ├── 重新请求 HTML → {{ghost_head}} 用最新 settingsCache
-├── Portal 脚本重新执行 init()
-  └── initSetup() → fetchApiData() → 读取最新 /settings/
+  ├── Portal 脚本重新执行 init()
+  └── initSetup() → fetchApiData() → 读取最新 /ghost/api/content/settings/
   └── ✓ 显示新设置
 ```
 
-**场景 2：** 打开新 Portal 弹窗（部分场景更新？不保证）
+**场景 2：** 打开 Portal 弹窗（不触发更新）
 
 ```javascript
-// 取决于设置来源：
-├── accent_color 来自 data-accent-color (script tag)
-│   不重新读取 script → ❌ 不更新
+// 弹窗打开时，Portal 仍是同一 React 实例：
+├── accent_color 从 dataset.accentColor 读取（script 标签静态快照）
+│   不重新读取 → ❌ 不更新
 │
-├── portal_button_style 来自 /content/settings/
-│   仅 initSetup() 时调用一次
-│   弹窗打开不重新调用 → ❌ 不更新
+├── portal_button_style 来自 /ghost/api/content/settings/
+│   仅 initSetup()（componentDidMount）时调用一次
+│   弹窗打开不重新初始化 → ❌ 不更新
 │
 └── member 状态来自 /members/api/member/
-    每次 API 调用 → ✓ 实时（非设置）
+    状态可能更新（如成员编辑资料后）→ ✓ 实时
+    但这是登录状态，不是 Portal 外观设置
 ```
 
-**场景 3：** 后台保存设置时手动强制刷新（后台预览
+**场景 3：** 后台预览 iframe 强制刷新（仅后台）
+
+**核心文件**：`ghost/admin/app/components/gh-site-iframe.js:32-56`
 
 ```javascript
-// gh-site-iframe.js 中使用 `resetSrcAttribute() 强制 iframe 重新加载：
-
-// ghost/admin/app/components/gh-site-iframe.js:32-56
+@action
 resetSrcAttribute(iframe) {
+    // guid 变化时强制 iframe 重新加载
     if (this.args.guid !== this._lastGuid) {
-        try {
-            if (iframe.contentWindow.location.reload();
-        } catch (e) {
-            if (e.name === 'SecurityError') {
-                iframe.src = this.srcUrl;
+        if (iframe) {
+            if (this.args.invisibleUntilLoaded) {
+                this.isInvisible = true;
+            }
+
+            try {
+                if (iframe.contentWindow.location.href !== this.srcUrl) {
+                    iframe.contentWindow.location = this.srcUrl;
+                } else {
+                    iframe.contentWindow.location.reload();
+                }
+            } catch (e) {
+                if (e.name === 'SecurityError') {
+                    // 跨域无法访问 contentWindow，回退到修改 src
+                    iframe.src = this.srcUrl;
+                }
             }
         }
+        this._lastGuid = this.args.guid;
     }
 }
 ```
+
+**生产环境无此机制**：访客浏览器没有任何服务端推送（WebSocket、SSE 等）来通知设置变化。
 
 #### 6.5.4 生产环境没有实时同步机制对比
 
 | 机制 | 已打开页面实时？ | 触发条件 | 延迟 |
 |------|-------------|---------|------|
-| 服务端内存缓存 | N/A | settingsCache 更新 | 毫秒级 |
+| 服务端内存缓存 | N/A | `settingsCache` 更新 | 毫秒级 |
 | 新页面渲染 | N/A | 新请求 | 下一次请求 |
 | 已打开页面 data-* | ❌ 否 | 刷新页面 | 直到用户刷新 |
 | 已打开页面 React state | ❌ 否 | 刷新页面 / 重新加载 Portal | 直到刷新 |
-| Content API /settings/ | ❌ 否 | Portal 重新 initSetup() | 直到刷新 |
+| Content API `/ghost/api/content/settings/` | ❌ 否 | Portal 重新 `initSetup()` | 直到刷新 |
 
 **结论**：生产环境已打开的页面**没有实时推送机制**。管理员修改设置后，已打开的浏览器标签页的 Portal 保持旧设置，直到用户刷新页面或打开新页面。
 
 ### 6.6 预览模式实时同步：URL hash 机制
 
-后台预览时，设置通过 URL hash 实时传递。这是**仅预览才有的实时同步机制，生产环境不使用。
+后台预览时，设置通过 URL hash 实时传递。这是**仅预览才有的实时同步机制**，生产环境不使用。
 
 #### 6.6.1 后台构建预览 URL
 
