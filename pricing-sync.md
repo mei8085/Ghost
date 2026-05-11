@@ -900,7 +900,7 @@ async archiveActiveRetentionOffers(offerId, cadence, options = {}) {
 | 方向 | 本地实体 | Stripe 实体 | 同步触发 |
 |------|----------|-------------|----------|
 | Tier → Stripe | Product + monthly/yearly_price | Product + Price | TierCreatedEvent / TierPriceChangeEvent |
-| Offer → Stripe | Offer | Coupon | OfferCreatedEvent（主路径）/ 首次使用（兜底容错） |
+| Offer → Stripe | Offer | Coupon | OfferCreatedEvent（主路径）/ stripe_coupon_id 为空时实时创建（兜底，支付链接与已有订阅应用两场景都会命中） |
 | Stripe → Offer | - | Coupon | linkSubscription（处理现有订阅的折扣） |
 
 ### 6.2 价格变更处理
