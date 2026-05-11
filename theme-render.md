@@ -1,11 +1,352 @@
 # Ghost 主题渲染权限与兼容性分析报告
 
 ## 目录
+0. [Private Site 私密站点模式：全站级访问控制](#0-private-site-私密站点模式全站级访问控制)
 1. [数据查询权限裁剪逻辑](#1-数据查询权限裁剪逻辑)
 2. [完整权限链路：访客身份 → visibility → access → Handlebars 渲染](#2-完整权限链路访客身份--visibility--access--handlebars-渲染)
 3. [Handlebars Helper 内容过滤机制](#3-handlebars-helper-内容过滤机制)
 4. [服务端渲染期会员凭证校验](#4-服务端渲染期会员凭证校验)
 5. [主题升级兼容兜底策略](#5-主题升级兼容兜底策略)
+
+---
+
+## 0. Private Site 私密站点模式：全站级访问控制
+
+### 0.1 概述
+
+**启用条件**：设置 `is_private = true` + `password`（访问密码）
+
+Private Site 是 Ghost 的**全站级访问控制**机制，与 Members 内容权限系统完全独立。启用后：
+- 所有未认证访客将被重定向到 `/private/` 页面
+- 需要输入正确的访问密码才能进入站点
+- 与 `posts.visibility` 和 `member` 权限裁剪是**层叠关系**（先过 private site 这一关，再经过 members 权限检查）
+
+### 0.2 请求管线中的挂载位置
+
+**文件**：`ghost/core/core/frontend/web/site.js` 第 89-95 行
+
+```javascript
+// setupMiddleware 在 loadMemberSession 之前执行
+config.get('apps:internal').forEach((appName) => {
+    const app = require(path.join(config.get('paths').internalAppPath, appName));
+    if (Object.prototype.hasOwnProperty.call(app, 'setupMiddleware')) {
+        app.setupMiddleware(siteApp);  // 这里挂载 private-blogging 的中间件
+    }
+});
+
+// loadMemberSession 在第 109 行
+siteApp.use(membersService.middleware.loadMemberSession);
+```
+
+**private-blogging/index.js** 第 49-56 行：
+```javascript
+setupMiddleware: function setupMiddleware(siteApp) {
+    siteApp.use(middleware.checkIsPrivate);       // 第一步：检查是否开启 private 模式
+    siteApp.use(middleware.filterPrivateRoutes);  // 第二步：路由过滤与认证
+},
+
+setupErrorHandling: function setupErrorHandling(siteApp) {
+    siteApp.use(middleware.handle404);  // 错误处理：404 时的重定向
+}
+```
+
+**完整管线顺序**：
+```
+HTTP 请求
+   │
+   ├─► privateBlogging.checkIsPrivate    ← 设置 res.isPrivateBlog
+   ├─► privateBlogging.filterPrivateRoutes ← 重定向未认证用户
+   │
+   ├─► loadMemberSession                  ← 加载会员（仅在通过 private 检查后才会到达）
+   ├─► themeMiddleware
+   ├─► siteRoutes
+   │      └─► fetch-data → post-gating → visibility/access 裁剪（第1-2节逻辑）
+   │
+   └─► privateBlogging.handle404         ← 404 时的二次检查
+```
+
+### 0.3 ghost-private 会话机制
+
+**文件**：`ghost/core/core/frontend/apps/private-blogging/lib/middleware.js` 第 70-75 行
+
+```javascript
+// checkIsPrivate 中间件
+checkIsPrivate: function checkIsPrivate(req, res, next) {
+    let isPrivateBlog = settingsCache.get('is_private');
+
+    if (!isPrivateBlog) {
+        res.isPrivateBlog = false;
+        return next();
+    }
+
+    res.isPrivateBlog = true;
+
+    // 初始化 cookie-session
+    return session({
+        name: 'ghost-private',           // Cookie 名称
+        maxAge: (30 * 24 * 60 * 60 * 1000), // 30天，单位：毫秒
+        signed: false,                   // ⚠️ 不使用签名（见下文安全分析）
+        sameSite: 'none'
+    })(req, res, next);
+},
+```
+
+**Session 存储内容**：
+```javascript
+// doLoginToPrivateSite 第 168-175 行
+const hasher = crypto.createHash('sha256');
+const salt = Date.now().toString();
+// ... 验证密码成功后
+hasher.update(submittedAccessCode + salt, 'utf8');
+req.session.token = hasher.digest('hex');  // SHA256(password + salt)
+req.session.salt = salt;                   // 时间戳盐值
+```
+
+**Session 验证**：
+```javascript
+// verifySessionHash 第 27-37 行
+function verifySessionHash(salt, hash) {
+    const accessCode = settingsCache.get('password');
+
+    if (!salt || !hash || !hasAccessCode(accessCode)) {
+        return false;
+    }
+
+    let hasher = crypto.createHash('sha256');
+    hasher.update(accessCode + salt, 'utf8');
+    return hasher.digest('hex') === hash;
+}
+```
+
+**安全设计分析**：
+
+| 特性 | 实现方式 | 说明 |
+|------|----------|------|
+| 防重放 | `salt = Date.now()` | 使用登录时的时间戳作为盐，每次登录生成不同的 token |
+| 防篡改 | `signed: false` | ⚠️ **注意**：Session 数据不使用 HMAC 签名 |
+| 存储位置 | Cookie | 整个 session 对象存储在 Cookie 中（cookie-session） |
+| 验证方式 | 服务器端重算哈希 | 不存储 session，通过重新计算 SHA256(password+salt) 验证 |
+
+**⚠️ 重要安全注意**：
+- `signed: false` 意味着 session cookie **没有签名保护**
+- 但由于 token 本身就是 `SHA256(password + salt)`，即使攻击者能修改 cookie，也需要知道 password 才能伪造有效 token
+- 与 `ghost-members-ssr` 使用的 `Keygrip` 签名机制不同（见第 4.3.3 节）
+
+### 0.4 访问放行与重定向规则
+
+**文件**：`middleware.js` 第 78-125 行 `filterPrivateRoutes`
+
+#### 0.4.1 无条件放行的路径
+
+| 路径 | 处理方式 | 原因 |
+|------|----------|------|
+| `/private/` | 直接放行 `next()` | 登录页面本身必须可访问 |
+| `/robots.txt` | 直接返回定制版 | 防止搜索引擎索引私有内容 |
+
+**robots.txt 内容**：
+```
+User-agent: *
+Disallow: /
+```
+
+#### 0.4.2 Private RSS Feed（特殊处理）
+
+```javascript
+// 第 107-112 行
+let isPrivateRSS = new RegExp(`/${settingsCache.get('public_hash')}/rss(/)?$`);
+if (isPrivateRSS.test(req.path)) {
+    req.url = req.url.replace(settingsCache.get('public_hash') + '/', '');
+    return next();
+}
+```
+
+**设计目的**：
+- `public_hash` 是一个随机哈希（站点设置）
+- RSS 阅读器无法输入密码，但可以在 URL 中携带 secret
+- 例如：`/777aaa/rss/` → 重写为 `/rss/` 并放行
+
+#### 0.4.3 正常认证流程
+
+```javascript
+// 第 114-124 行
+privateBlogging.authenticatePrivateSession(req, res, function onSessionVerified() {
+    // CASE: 认证通过后，禁止普通 RSS（但 private RSS 已在上面放行）
+    if (req.path.match(/\/rss\/$/)) {
+        return next(new errors.NotFoundError({message: 'Page not found.'}));
+    }
+    next();  // 继续正常请求处理
+});
+```
+
+**authenticatePrivateSession** 逻辑（第 127-140 行）：
+```javascript
+authenticatePrivateSession: function authenticatePrivateSession(req, res, next) {
+    const hash = req.session.token || '';
+    const salt = req.session.salt || '';
+    const isVerified = verifySessionHash(salt, hash);
+
+    if (isVerified) {
+        return next();  // 认证通过
+    } else {
+        // 认证失败，重定向到登录页，保留原 URL
+        let redirectUrl = urlUtils.urlFor({relativeUrl: privateRoute});
+        redirectUrl += '?r=' + encodeURIComponent(req.url);
+        return res.redirect(redirectUrl);
+    }
+}
+```
+
+**重定向 URL 安全验证**（第 39-57 行）：
+```javascript
+function getRedirectUrl(query) {
+    try {
+        const redirect = decodeURIComponent(query.r || '/');
+        const parsedUrl = new URL(redirect, config.get('url'));
+        const pathname = parsedUrl.pathname;
+        const search = parsedUrl.search;
+
+        const base = new URL(config.get('url'));
+        const target = new URL(pathname, config.get('url'));
+        
+        // 关键：确保不会重定向到外部域名（防钓鱼）
+        if (target.host !== base.host) {
+            return '/';
+        }
+        return pathname + search;
+    } catch (e) {
+        return '/';
+    }
+}
+```
+
+### 0.5 登录流程
+
+**文件**：`lib/router.js` 第 29-42 行
+
+```javascript
+privateRouter
+    .route('/')
+    .get(
+        middleware.redirectPrivateToHomeIfLoggedIn,  // 已登录则直接跳首页
+        _renderer
+    )
+    .post(
+        bodyParser.urlencoded({extended: true}),
+        middleware.redirectPrivateToHomeIfLoggedIn,
+        web.shared.middleware.brute.privateBlog,      // 防暴力破解
+        middleware.doLoginToPrivateSite,
+        _renderer
+    );
+```
+
+**登录处理**（middleware.js 第 160-184 行）：
+```javascript
+doLoginToPrivateSite: function doLoginToPrivateSite(req, res, next) {
+    const submittedAccessCode = req.body && req.body.password;
+    const accessCode = settingsCache.get('password');
+    const forward = getRedirectUrl(req.query);
+
+    if (hasAccessCode(accessCode) && hasAccessCode(submittedAccessCode) && accessCode === submittedAccessCode) {
+        // 密码正确：设置 session 并重定向
+        const hasher = crypto.createHash('sha256');
+        const salt = Date.now().toString();
+        hasher.update(submittedAccessCode + salt, 'utf8');
+        req.session.token = hasher.digest('hex');
+        req.session.salt = salt;
+        return res.redirect(urlUtils.urlFor({relativeUrl: forward}));
+    } else {
+        // 密码错误：返回登录页并显示错误
+        res.error = {message: 'Incorrect access code.'};
+        return next();
+    }
+}
+```
+
+### 0.6 404 特殊处理
+
+**文件**：`middleware.js` 第 186-205 行
+
+```javascript
+handle404: function handle404(err, req, res, next) {
+    // 非私有站点：继续下一个错误处理器
+    if (!res.isPrivateBlog) {
+        return next(err);
+    }
+    
+    // 非 404 错误：直接抛出
+    if (err.statusCode !== 404) {
+        return next(err);
+    }
+    
+    // 关键安全设计：404 时也要检查认证
+    // 未认证用户：重定向到 /private/（防止通过 404 泄露路径存在性）
+    // 已认证用户：显示正常的 404 页面
+    return privateBlogging.authenticatePrivateSession(req, res, function onSessionVerified() {
+        return next(err);
+    });
+}
+```
+
+**设计意图**：防止攻击者通过尝试不同路径并观察是 404 还是重定向来推断站点的内容结构。
+
+### 0.7 与 Members 权限系统的职责边界
+
+| 维度 | Private Site | Members Visibility / Access |
+|------|-------------|----------------------------|
+| **控制层级** | 全站级 | 单篇文章级 |
+| **触发位置** | 请求管线最前端（`filterPrivateRoutes`） | API 序列化层（`post-gating.js`） |
+| **认证方式** | 统一访问密码 | 会员系统（Magic Link / 订阅） |
+| **会话 Cookie** | `ghost-private`（cookie-session） | `ghost-members-ssr`（Keygrip 签名） |
+| **会话时长** | 30 天（`30 * 24 * 60 * 60 * 1000` ms） | 约 6 个月（`1000 * 60 * 60 * 24 * 184` ms） |
+| **效果** | 未通过 → 重定向到 `/private/` | 未通过 → 裁剪内容 + 设置 `access=false` |
+| **用户感知** | 必须先输入密码才能看到任何内容 | 能看到文章列表，但会员专享内容被裁剪 |
+
+**层叠关系**：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    HTTP 请求                                          │
+│                        │                                             │
+│              ┌─────────▼─────────┐                                   │
+│              │  Private Site     │                                   │
+│              │  (checkIsPrivate) │                                   │
+│              │                   │                                   │
+│              │  is_private=false │──────┐                              │
+│              │       OR          │      │ 继续                          │
+│              │  已认证通过        │      │                              │
+│              └───────────────────┘      │                              │
+│                        │               │                              │
+│              ┌─────────▼─────────┐     │                              │
+│              │  认证失败         │◄────┘                              │
+│              │  重定向到 /private│                                    │
+│              └───────────────────┘                                    │
+│                        │                                             │
+│              ┌─────────▼─────────┐                                   │
+│              │  loadMemberSession│  ← 仅在通过 Private 检查后执行        │
+│              │  (Members 会员)   │                                   │
+│              └───────────────────┘                                    │
+│                        │                                             │
+│              ┌─────────▼─────────┐                                   │
+│              │  fetch-data       │                                   │
+│              │  post-gating      │  ← 按 members visibility 裁剪内容    │
+│              │  (第1-2节逻辑)    │                                   │
+│              └───────────────────┘                                    │
+│                        │                                             │
+│              ┌─────────▼─────────┐                                   │
+│              │  主题渲染          │                                   │
+│              │  {{#has visibility}}│                                   │
+│              │  {{#if access}}    │                                   │
+│              └───────────────────┘                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**启用组合场景**：
+
+1. **只启用 Private Site**：全站需要密码，所有通过认证的用户看到相同内容（post-gating 仍生效，但 member=null，所以 members/paid 文章会被裁剪）
+
+2. **只启用 Members**：公开内容可见，会员专享内容需要登录
+
+3. **同时启用两者**：必须先输入 Private Site 密码 → 然后再登录会员账号 → 才能看到付费内容
 
 ---
 
