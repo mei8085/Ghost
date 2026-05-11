@@ -21,58 +21,80 @@ Ghost 的 newsletter 邮件渲染系统采用三层服务架构：
 ┌─────────────────────────────────────────────────────────────┐
 │                    BatchSendingService                       │
 │  (批量调度：分批、并发控制、重试机制、域名预热)              │
+│  ghost/core/core/server/services/email-service/              │
+│  batch-sending-service.js                                    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      SendingService                          │
 │  (发送协调：缓存渲染结果、构建收件人列表、调用 Provider)     │
+│  ghost/core/core/server/services/email-service/              │
+│  sending-service.js                                          │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      EmailRenderer                           │
 │  (核心渲染：模板解析、变量替换、CSS 内联、客户端兼容处理)     │
+│  ghost/core/core/server/services/email-service/              │
+│  email-renderer.js                                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### 依赖注入初始化
 
-**文件**：`ghost/core/core/server/services/email-service/email-service-wrapper.js:13`
+**文件**：`ghost/core/core/server/services/email-service/email-service-wrapper.js:13-110`
 
 ```javascript
 init() {
-    const i18nLanguage = settingsCache.get('locale') || 'en';  // 从 settings 读 locale
-    const i18n = i18nLib(i18nLanguage, 'ghost');              // 创建 i18n 实例
+    // i18n 初始化
+    const i18nLanguage = settingsCache.get('locale') || 'en';  // email-service-wrapper.js:62
+    const i18n = i18nLib(i18nLanguage, 'ghost');              // email-service-wrapper.js:63
 
+    // 监听 locale 变化
+    events.on('settings.locale.edited', (model) => {
+        i18n.changeLanguage(model.get('value'));             // email-service-wrapper.js:69
+    });
+
+    // EmailRenderer 初始化（包含 i18n 注入）
     const emailRenderer = new EmailRenderer({
         settingsCache,
         // ...
-        t: i18n.t,           // 注入真实的 i18n.t 翻译函数
-        dir: i18n.dir.bind(i18n)  // 注入 i18n.dir 方向判断
+        t: i18n.t,                                           // email-service-wrapper.js:94
+        dir: i18n.dir.bind(i18n)                              // email-service-wrapper.js:95
     });
 
+    // SendingService 初始化
     const sendingService = new SendingService({
-        emailProvider: mailgunEmailProvider,
+        emailProvider: mailgunEmailProvider,                   // email-service-wrapper.js:105
         emailRenderer,
-        // ...
+        emailAddressService
     });
 
+    // BatchSendingService 初始化
     const batchSendingService = new BatchSendingService({
-        sendingService,
         emailRenderer,
-        // ...
+        sendingService,
+        jobsService,
+        emailSegmenter,
+        domainWarmingService,
+        models,
+        db,
+        sentry
     });
 }
 ```
 
 ### 渲染流程总览
 
-1. **触发发送**：`BatchSendingService.emailJob()` 被 JobsService 调度执行
-2. **创建批次**：按 1000 人/批创建 `EmailBatch`，关联 `EmailRecipient`
-3. **渲染邮件体**：`EmailRenderer.renderBody()` 执行完整渲染流水线
-4. **构建收件人**：`SendingService.buildRecipients()` 绑定个性化变量
-5. **发送**：通过 Mailgun 等 Provider 批量发送
+| 步骤 | 函数 | 文件 | 行号 |
+|------|------|------|------|
+| 1. 触发发送 | `BatchSendingService.emailJob()` | `batch-sending-service.js` | 133 |
+| 2. 创建批次 | `BatchSendingService.createBatches()` | `batch-sending-service.js` | 237 |
+| 3. 渲染邮件体 | `EmailRenderer.renderBody()` | `email-renderer.js` | 393 |
+| 4. 构建收件人 | `SendingService.buildRecipients()` | `sending-service.js` | 162 |
+| 5. 发送 | `SendingService.send()` → Provider | `sending-service.js` | 110 |
 
 ---
 
@@ -114,17 +136,17 @@ init() {
 defaults: function defaults() {
     return {
         // 语义值（非 HEX）
-        background_color: 'light',           // 语义值
-        header_background_color: 'transparent',  // 语义值
-        button_color: 'accent',              // 语义值
-        link_color: 'accent',                // 语义值
+        background_color: 'light',           // newsletter.js:30 - 语义值
+        header_background_color: 'transparent',  // newsletter.js:32 - 语义值
+        button_color: 'accent',              // newsletter.js:28 - 语义值
+        link_color: 'accent',                // newsletter.js:29 - 语义值
         
         // 枚举值
-        button_corners: 'rounded',           // square | rounded | pill
-        button_style: 'fill',                // fill | outline
-        title_font_weight: 'bold',           // normal | medium | semibold | bold
-        link_style: 'underline',             // underline | plain
-        image_corners: 'square',             // square | rounded
+        button_corners: 'rounded',           // newsletter.js:36 - square | rounded | pill
+        button_style: 'fill',                // newsletter.js:34 - fill | outline
+        title_font_weight: 'bold',           // newsletter.js:22 - normal | medium | semibold | bold
+        link_style: 'underline',             // newsletter.js:31 - underline | plain
+        image_corners: 'square',             // newsletter.js:37 - square | rounded
         
         // 布尔值
         show_badge: true,
@@ -248,62 +270,63 @@ export function resolveButtonCorners(corners: string | undefined): string {
 ```javascript
 // email-design.js 只处理 HEX 颜色，不识别 'light'、'transparent' 等语义值
 
-const DEFAULT_ACCENT_COLOR = '#15212A';
-const DEFAULT_DIVIDER_COLOR = '#e0e7eb';
-const VALID_HEX_REGEX = /^#([0-9a-f]{3}){1,2}$/i;
+const DEFAULT_ACCENT_COLOR = '#15212A';     // email-design.js:29
+const DEFAULT_DIVIDER_COLOR = '#e0e7eb';    // email-design.js:30
+const VALID_HEX_REGEX = /^#([0-9a-f]{3}){1,2}$/i;  // email-design.js:27
 
 const getHexColor = (value, fallback) => (isValidHexColor(value) ? value : fallback);
+// isValidHexColor 只接受 #xxx 格式，'light'、'transparent' 都返回 false
 
 exports.getEmailDesign = (settings) => {
     // accentColor: 无效值回退到 DEFAULT_ACCENT_COLOR (#15212A)
-    const accentColor = getHexColor(settings.accentColor, DEFAULT_ACCENT_COLOR);
+    const accentColor = getHexColor(settings.accentColor, DEFAULT_ACCENT_COLOR);  // email-design.js:76
     
     // backgroundColor: 无效值回退到 #ffffff（'light' 被视为无效）
-    const backgroundColor = getHexColor(settings.backgroundColor, '#ffffff');
+    const backgroundColor = getHexColor(settings.backgroundColor, '#ffffff');      // email-design.js:79
     
     // buttonColor: 'accent' 被特殊处理，其他无效值回退到 accentColor
     let buttonColor;
     switch (settings.buttonColor) {
     case 'accent':
-        buttonColor = accentColor;
+        buttonColor = accentColor;                                    // email-design.js:84
         break;
     case null:
-        buttonColor = textColorForBackgroundColor(backgroundColor).hex();
+        buttonColor = textColorForBackgroundColor(backgroundColor).hex();  // email-design.js:87
         break;
     default:
-        buttonColor = getHexColor(settings.buttonColor, accentColor);
+        buttonColor = getHexColor(settings.buttonColor, accentColor);     // email-design.js:91
         break;
     }
     
     // dividerColor: 'accent' 被特殊处理
     let dividerColor;
     if (settings.dividerColor === 'accent') {
-        dividerColor = accentColor;
+        dividerColor = accentColor;                                 // email-design.js:96
     } else {
-        dividerColor = getHexColor(settings.dividerColor, DEFAULT_DIVIDER_COLOR);
+        dividerColor = getHexColor(settings.dividerColor, DEFAULT_DIVIDER_COLOR);  // email-design.js:99
     }
     
     // headerBackgroundColor: 'accent' 被特殊处理，其他无效值 → null
     let headerBackgroundColor;
     if (settings.headerBackgroundColor === 'accent') {
-        headerBackgroundColor = accentColor;
+        headerBackgroundColor = accentColor;                        // email-design.js:104
     } else if (isValidHexColor(settings.headerBackgroundColor)) {
-        headerBackgroundColor = settings.headerBackgroundColor;
+        headerBackgroundColor = settings.headerBackgroundColor;     // email-design.js:107
     } else {
-        headerBackgroundColor = null;  // 'transparent' → null
+        headerBackgroundColor = null;  // 'transparent' → null      // email-design.js:110
     }
     
     // linkColor: 'accent' 被特殊处理
     let linkColor;
     switch (settings.linkColor) {
     case 'accent':
-        linkColor = accentColor;
+        linkColor = accentColor;                                    // email-design.js:116
         break;
     case null:
-        linkColor = textColorForBackgroundColor(backgroundColor).hex();
+        linkColor = textColorForBackgroundColor(backgroundColor).hex();  // email-design.js:119
         break;
     default:
-        linkColor = getHexColor(settings.linkColor, accentColor);
+        linkColor = getHexColor(settings.linkColor, accentColor);       // email-design.js:123
         break;
     }
     
@@ -313,7 +336,7 @@ exports.getEmailDesign = (settings) => {
     case 'normal': titleWeight = 400; break;
     case 'medium': titleWeight = 500; break;
     case 'semibold': titleWeight = 600; break;
-    default: titleWeight = 700; break;
+    default: titleWeight = 700; break;                                 // 'bold'
     }
     
     return {
@@ -342,9 +365,9 @@ const INVALID_HEX_COLORS = [
     ['#ff9900'],
     '',
     'invalid',
-    'accent',       // 被视为无效（除非特殊处理）
-    'light',        // 被视为无效！
-    'dark',         // 被视为无效！
+    'accent',       // email-design.test.js:18 - 被视为无效（除非特殊处理）
+    'light',        // email-design.test.js:19 - 被视为无效！
+    'dark',         // email-design.test.js:20 - 被视为无效！
     '#',
     '#F',
     // ...
@@ -360,16 +383,16 @@ it('returns the default background color when input is invalid', function () {
 
 #### EmailRenderer 调用 getEmailDesign
 
-**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:1025`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:1025-1058`
 
 ```javascript
 async getTemplateData({post, newsletter, html, addPaywall, segment}) {
-    const emailDesign = this.#getEmailDesign(newsletter);
+    const emailDesign = this.#getEmailDesign(newsletter);              // email-renderer.js:1026
     // ...
     const data = {
         // ...
         // CSS 变量：展开 emailDesign
-        ...emailDesign,
+        ...emailDesign,                                               // email-renderer.js:1047
         // ...
     };
 }
@@ -544,7 +567,7 @@ buildReplacementDefinitions({html, newsletterUuid}) {
 
 ### Fallback 机制
 
-**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:813-842`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:813-860`
 
 ```javascript
 const EMAIL_REPLACEMENT_REGEX = /%%\{(.*?)\}%%/g;
@@ -606,7 +629,37 @@ getMemberStatusText(member) {
         return '';
     }
 
-    // ... 处理 paid、comped 等状态
+    if (member.status === 'paid') {
+        let activeSubscription = member.subscriptions.find((subscription) => {
+            return subscription.status === 'trialing' || subscription.status === 'active';
+        });
+        if (!activeSubscription) {
+            return '';
+        }
+        
+        if (activeSubscription.trial_end_at && activeSubscription.trial_end_at > new Date()) {
+            const date = formatDateLong(activeSubscription.trial_end_at, timezone, locale);
+            return t(messages.subscriptionStatus.trial, {date});
+        }
+
+        const date = formatDateLong(activeSubscription.current_period_end, timezone, locale);
+        if (activeSubscription.cancel_at_period_end) {
+            return t(messages.subscriptionStatus.canceled, {date});
+        }
+        return t(messages.subscriptionStatus.active, {date});
+    }
+
+    if (member.status === 'comped') {
+        const expires = member.tiers[0]?.expiry_at ?? null;
+        if (expires) {
+            const timezone = this.#settingsCache.get('timezone');
+            const date = formatDateLong(expires, timezone, locale);
+            return t(messages.subscriptionStatus.complimentaryExpires, {date});
+        }
+        return t(messages.subscriptionStatus.complimentaryInfinite);
+    }
+
+    return '';
 }
 ```
 
@@ -616,7 +669,7 @@ getMemberStatusText(member) {
 
 **步骤 2 - 发送时**：`SendingService.buildRecipients()` 为每个会员计算实际值
 
-**文件**：`ghost/core/core/server/services/email-service/sending-service.js:162`
+**文件**：`ghost/core/core/server/services/email-service/sending-service.js:162-182`
 
 ```javascript
 buildRecipients(members, replacementDefinitions) {
@@ -632,7 +685,12 @@ buildRecipients(members, replacementDefinitions) {
             })
         };
     }).filter((recipient) => {
-        return validator.isEmail(recipient.email, {legacy: false});
+        // Remove invalid recipient email addresses
+        const isValidRecipient = validator.isEmail(recipient.email, {legacy: false});
+        if (!isValidRecipient) {
+            logging.warn(`Removed recipient ${recipient.email} from list because it is not a valid email address`);
+        }
+        return isValidRecipient;
     });
 }
 ```
@@ -643,119 +701,341 @@ buildRecipients(members, replacementDefinitions) {
 
 ### 分批策略
 
-**文件**：`ghost/core/core/server/services/email-service/batch-sending-service.js:237`
+**文件**：`ghost/core/core/server/services/email-service/batch-sending-service.js:237-340`
 
 ```javascript
 async createBatches({email, post, newsletter}) {
+    logging.info(`Creating batches for email ${email.id}`);
+
+    // 域名预热限制
+    let domainWarmupLimit = Infinity;
+    if (this.#domainWarmingService.isEnabled()) {
+        domainWarmupLimit = Number.isInteger(email.get('csd_email_count')) ? email.get('csd_email_count') : Infinity;
+    }
+
     const segments = await this.#emailRenderer.getSegments(post);
-    const BATCH_SIZE = this.#sendingService.getMaximumRecipients();  // 1000
-    
+    const batches = [];
+    const BATCH_SIZE = this.#sendingService.getMaximumRecipients();  // batch-sending-service.js:248
+    let totalCount = 0;
+
     for (const segment of segments) {
-        let lastId = email.id;  // ObjectId 用于游标分页
-        
+        const segmentFilter = this.#emailSegmenter.getMemberFilterForSegment(
+            newsletter, 
+            email.get('recipient_filter'), 
+            segment
+        );  // batch-sending-service.js:254
+
+        // 使用 ObjectId 游标分页，确保只包含邮件创建时已存在的会员
+        // 注：使用 id 而非 created_at，因为导入会员可能设置 created_at 为过去/未来值
+        let lastId = email.id;  // batch-sending-service.js:261
+
         while (!members || lastId) {
-            // 按 id < email.id 确保只包含邮件创建时已存在的会员
-            const filter = segmentFilter + `+id:<'${lastId}'`;
+            // 按 id < email.id 过滤
+            const filter = segmentFilter + `+id:<'${lastId}'`;  // batch-sending-service.js:266
+
             members = await this.#models.Member.getFilteredCollectionQuery({filter})
                 .orderByRaw('id DESC')
                 .select('members.id', 'members.uuid', 'members.email', 'members.name')
-                .limit(BATCH_SIZE + 1);
-            
+                .limit(BATCH_SIZE + 1);  // batch-sending-service.js:269-271
+
             if (members.length > 0) {
-                // 创建 EmailBatch + EmailRecipient 记录
-                await this.createBatch(email, segment, members.slice(0, BATCH_SIZE), options);
+                const remainingCustomDomainCapacity = domainWarmupLimit - totalCount;
+                const membersToProcess = Math.min(members.length, BATCH_SIZE);
+
+                const shouldSplitBatch = remainingCustomDomainCapacity > 0 && remainingCustomDomainCapacity < membersToProcess;
+                if (shouldSplitBatch) {
+                    // 拆分批次：部分走自定义域名，部分走 fallback
+                    totalCount += await this.#createBatchWithRetry({
+                        email,
+                        segment,
+                        members: members.slice(0, remainingCustomDomainCapacity),
+                        useFallbackDomain: false,
+                        batches
+                    });
+                    totalCount += await this.#createBatchWithRetry({
+                        email,
+                        segment,
+                        members: members.slice(remainingCustomDomainCapacity, membersToProcess),
+                        useFallbackDomain: true,
+                        batches
+                    });
+                } else {
+                    // 单一批次
+                    totalCount += await this.#createBatchWithRetry({
+                        email,
+                        segment,
+                        members: members.slice(0, membersToProcess),
+                        useFallbackDomain: totalCount >= domainWarmupLimit,
+                        batches
+                    });
+                }
             }
-            
-            lastId = members.length > BATCH_SIZE ? members[BATCH_SIZE - 1].id : null;
+
+            // 更新游标：如果有 BATCH_SIZE + 1 条，说明还有更多
+            if (members.length > BATCH_SIZE) {
+                lastId = members[members.length - 2].id;  // batch-sending-service.js:308
+            } else {
+                break;
+            }
         }
     }
+
+    // 校验并更新 email_count
+    if (email.get('email_count') !== totalCount) {
+        await email.save({
+            email_count: totalCount,
+            ...(this.#domainWarmingService.isEnabled() 
+                ? {csd_email_count: Math.min(totalCount, domainWarmupLimit)} 
+                : {})
+        }, {patch: true, require: false, autoRefresh: false});
+    }
+
+    return batches;
+}
+```
+
+### 创建 EmailBatch + EmailRecipient
+
+**文件**：`ghost/core/core/server/services/email-service/batch-sending-service.js:382-426`
+
+```javascript
+async createBatch(email, segment, members, options) {
+    if (!options || !options.transacting) {
+        return this.#models.EmailBatch.transaction(async (transacting) => {
+            return this.createBatch(email, segment, members, {transacting, ...options});
+        });
+    }
+
+    const batch = await this.#models.EmailBatch.add({
+        email_id: email.id,
+        member_segment: segment,
+        status: 'pending',
+        fallback_sending_domain: Boolean(options.useFallbackDomain)
+    }, options);  // batch-sending-service.js:391-396
+
+    // 构建 EmailRecipient 数据
+    const recipientData = [];
+    members.forEach((memberRow) => {
+        if (!memberRow.id || !memberRow.uuid || !memberRow.email) {
+            logging.warn(`Member row not included as email recipient due to missing data`);
+            return;
+        }
+
+        recipientData.push({
+            id: ObjectID().toHexString(),
+            email_id: email.id,
+            member_id: memberRow.id,
+            batch_id: batch.id,
+            member_uuid: memberRow.uuid,
+            member_email: memberRow.email,
+            member_name: memberRow.name
+        });  // batch-sending-service.js:406-414
+    });
+
+    // 批量插入
+    const insertQuery = this.#db.knex('email_recipients').insert(recipientData);
+    if (options.transacting) {
+        insertQuery.transacting(options.transacting);
+    }
+    await insertQuery;  // batch-sending-service.js:417-424
+
+    return batch;
 }
 ```
 
 ### 分段渲染（免费/付费会员不同内容）
 
-**文件**：`ghost/core/core/server/services/email-renderer.js:335`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:335-361`
 
 ```javascript
 async getSegments(post) {
     const allowedSegments = ['status:free', 'status:-free'];
     const html = await this.renderPostBaseHtml(post);
-    
-    // 1. 有 paywall card → 必须分两段
+
+    // 1. 有 paywall card (<!--members-only-->) → 必须分两段
     if (html.indexOf('<!--members-only-->') !== -1) {
-        return allowedSegments;
+        // 免费和付费会员内容不同
+        return allowedSegments;  // email-renderer.js:344
     }
-    
-    // 2. 检查 data-gh-segment 属性
+
     const $ = cheerioLoad(html);
-    const segments = $('[data-gh-segment]')
+
+    // 2. 检查 data-gh-segment 属性
+    let allSegments = $('[data-gh-segment]')
         .get()
         .map(el => el.attribs['data-gh-segment']);
-    
-    return [...new Set(segments)].filter(segment => allowedSegments.includes(segment));
+
+    const segments = [...new Set(allSegments)].filter(segment => allowedSegments.includes(segment));
+    if (segments.length === 0) {
+        // 无差异 → 单一段 [null]
+        return [null];  // email-renderer.js:356
+    }
+
+    // 有差异 → 分两段
+    return allowedSegments;
 }
 ```
 
 ### 应用分段过滤
 
-**文件**：`ghost/core/core/server/services/email-renderer.js:393`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:393-585`
 
 ```javascript
 async renderBody(post, newsletter, segment, options) {
     let html = await this.renderPostBaseHtml(post, newsletter);
-    
-    // 移除不属于当前分段的内容
-    $('[data-gh-segment]').get().forEach((node) => {
-        if (node.attribs['data-gh-segment'] !== segment) {
-            $(node).remove();
-        } else {
-            $(node).removeAttr('data-gh-segment');
-        }
-    });
-    
-    // 付费文章免费会员截断 + 添加 paywall
+
+    // Paywall 和会员专属内容处理
     const isPaidPost = post.get('visibility') === 'paid' || post.get('visibility') === 'tiers';
     const membersOnlyIndex = html.indexOf('<!--members-only-->');
-    if (isPaidPost && membersOnlyIndex !== -1 && segment === 'status:free') {
-        html = html.slice(0, membersOnlyIndex);  // 截断
-        addPaywall = true;
+    const hasMembersOnlyContent = membersOnlyIndex !== -1;
+    let addPaywall = false;
+
+    if (isPaidPost && hasMembersOnlyContent) {
+        if (segment === 'status:free') {
+            // 免费会员：截断内容 + 添加 paywall
+            addPaywall = true;
+            html = html.slice(0, membersOnlyIndex);  // 截断  // email-renderer.js:408
+        }
     }
+
+    let $ = cheerioLoad(html);
+
+    // 移除不属于当前分段的内容（在模板渲染前执行，因为 preheader 可能用到）
+    $('[data-gh-segment]').get().forEach((node) => {
+        if (node.attribs['data-gh-segment'] !== segment) {
+            $(node).remove();  // email-renderer.js:421
+        } else {
+            $(node).removeAttr('data-gh-segment');  // 清理属性
+        }
+    });  // email-renderer.js:418-426
+
+    html = $.html();
+
+    const templateData = await this.getTemplateData({
+        post,
+        newsletter,
+        html,
+        addPaywall,
+        segment
+    });
+    html = await this.renderTemplate(templateData);
+
+    // ... 后续：链接跟踪、Juice、兼容处理等
 }
 ```
 
 ### 并发控制与重试
 
-**文件**：`ghost/core/core/server/services/email-service/batch-sending-service.js:466`
+**文件**：`ghost/core/core/server/services/email-service/batch-sending-service.js:10, 37-39, 466-478, 675-728`
 
 ```javascript
-const MAX_SENDING_CONCURRENCY = 2;  // 最多 2 个批次并发发送
+const MAX_SENDING_CONCURRENCY = 2;  // 最多 2 个批次并发发送  // batch-sending-service.js:10
 
-// 数据库操作重试（发送前）
-#BEFORE_RETRY_CONFIG = {maxRetries: 10, maxTime: 10 * 60 * 1000, sleep: 2000};
+// 重试配置
+#BEFORE_RETRY_CONFIG = {maxRetries: 10, maxTime: 10 * 60 * 1000, sleep: 2000};     // batch-sending-service.js:37
+#AFTER_RETRY_CONFIG = {maxRetries: 20, maxTime: 30 * 60 * 1000, sleep: 2000};       // batch-sending-service.js:38
+#MAILGUN_API_RETRY_CONFIG = {sleep: 10 * 1000, maxRetries: 6};                        // batch-sending-service.js:39
 
-// 数据库操作重试（发送后）
-#AFTER_RETRY_CONFIG = {maxRetries: 20, maxTime: 30 * 60 * 1000, sleep: 2000};
+// 并发控制实现
+async sendBatches({email, batches, post, newsletter}) {
+    const queue = batches.slice();
 
-// Mailgun API 重试
-#MAILGUN_API_RETRY_CONFIG = {sleep: 10 * 1000, maxRetries: 6};
+    // 递归 worker
+    let runNext;
+    runNext = async () => {
+        const batch = queue.shift();
+        if (batch) {
+            if (await this.sendBatch({...})) {
+                succeededCount += 1;
+            }
+            await runNext();  // 递归调用
+        }
+    };
+
+    // 启动 MAX_SENDING_CONCURRENCY 个并发 worker
+    await Promise.all(
+        new Array(MAX_SENDING_CONCURRENCY).fill(0).map(() => runNext())
+    );  // batch-sending-service.js:467
+
+    if (succeededCount < batches.length) {
+        throw new errors.EmailError({...});
+    }
+}
+
+// 重试实现
+async retryDb(func, options) {
+    const retryCount = (options.retryCount ?? 0);
+
+    try {
+        const response = await func();
+        return response;
+    } catch (e) {
+        const sleep = (options.sleep ?? 0);
+        
+        // 超过最大重试次数或截止时间 → 抛出
+        if (retryCount >= options.maxRetries 
+            || (options.stopAfterDate && (new Date(Date.now() + sleep)) > options.stopAfterDate)) {
+            throw e;
+        }
+
+        // 等待 → 指数退避（sleep * 2）
+        if (sleep) {
+            await new Promise((resolve) => setTimeout(resolve, sleep));
+        }
+        return await this.retryDb(
+            func, 
+            {...options, retryCount: retryCount + 1, sleep: sleep * 2}  // 指数退避
+        );  // batch-sending-service.js:726
+    }
+}
 ```
 
 ### 缓存渲染结果
 
-**文件**：`ghost/core/core/server/services/email-service/sending-service.js:119`
+**文件**：`ghost/core/core/server/services/email-service/sending-service.js:110-154`
 
 ```javascript
-const cacheId = emailId + '-' + (segment ?? 'null');
+async send({post, newsletter, segment, members, emailId}, options) {
+    const cacheId = emailId + '-' + (segment ?? 'null');  // sending-service.js:111
+    const isTestEmail = options.isTestEmail ?? false;
 
-if (options.emailBodyCache) {
-    emailBody = options.emailBodyCache.get(cacheId);
-}
+    let emailBody;
 
-if (!emailBody) {
-    emailBody = await this.#emailRenderer.renderBody(post, newsletter, segment, options);
+    // 尝试从缓存获取
     if (options.emailBodyCache) {
-        options.emailBodyCache.set(cacheId, emailBody);
+        emailBody = options.emailBodyCache.get(cacheId);  // sending-service.js:120
     }
+
+    // 缓存未命中 → 渲染
+    if (!emailBody) {
+        emailBody = await this.#emailRenderer.renderBody(
+            post,
+            newsletter,
+            segment,
+            {
+                clickTrackingEnabled: !!options.clickTrackingEnabled
+            }
+        );  // sending-service.js:124-131
+        
+        // 写入缓存
+        if (options.emailBodyCache) {
+            options.emailBodyCache.set(cacheId, emailBody);  // sending-service.js:133
+        }
+    }
+
+    // 构建收件人 → 调用 Provider
+    const recipients = this.buildRecipients(members, emailBody.replacements);
+    return await this.#emailProvider.send({
+        subject: this.#emailRenderer.getSubject(post, isTestEmail),
+        from: this.#emailRenderer.getFromAddress(post, newsletter, !!options.useFallbackAddress),
+        replyTo: this.#emailRenderer.getReplyToAddress(post, newsletter, !!options.useFallbackAddress) ?? undefined,
+        html: emailBody.html,
+        plaintext: emailBody.plaintext,
+        recipients,
+        emailId: emailId,
+        replacementDefinitions: emailBody.replacements,
+        domainOverride: options.useFallbackAddress ? this.#emailAddressService.fallbackDomain : undefined
+    }, {...});
 }
 ```
 
@@ -765,40 +1045,91 @@ if (!emailBody) {
 
 #### 1. Juice 内联 CSS
 
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:523-525`
+
 ```javascript
+// Juice HTML (inline CSS)
 const juice = require('juice');
 html = juice(html, {inlinePseudoElements: true, removeStyleTags: true});
 ```
 
-将 `<style>` 中的样式内联到 `style` 属性，因为 Gmail、Outlook 等客户端会移除 `<style>` 标签。
+**目的**：将 `<style>` 中的样式内联到 `style` 属性，因为 Gmail、Outlook 等客户端会移除 `<style>` 标签。
 
 #### 2. 图片尺寸修复（Outlook 不支持 width: auto）
 
-```javascript
-// 记录原始 width/height 属性
-const originalImageSizes = $('img').get().map((image) => {
-    return {src: image.attribs.src, width: image.attribs.width, height: image.attribs.height};
-});
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:506-517, 530-543`
 
-// Juice 内联后可能把 width/height 设为 'auto'
-// Outlook 不支持，需要恢复原始值
+```javascript
+// 在 Juice 内联前记录原始 width/height 属性
+// 如果 CSS 设置了 width: auto 或 height: auto，Juice 会显式设置到属性上
+// 这是 Outlook 不支持的，需要恢复原始值
+const originalImageSizes = $('img').get().map((image) => {
+    const src = image.attribs.src;
+    const width = image.attribs.width;
+    const height = image.attribs.height;
+    return {src, width, height};
+});  // email-renderer.js:512-517
+
+// ... Juice 内联后 ...
+
+// 重置任何 height="auto" 或 width="auto" 到原始值
+const imageTags = $('img').get();
 for (let i = 0; i < imageTags.length; i += 1) {
-    if (imageTags[i].attribs.width === 'auto' && originalImageSizes[i].width) {
-        imageTags[i].attribs.width = originalImageSizes[i].width;
+    if (imageTags[i].attribs.src === originalImageSizes[i].src) {
+        if (imageTags[i].attribs.width === 'auto' && originalImageSizes[i].width) {
+            imageTags[i].attribs.width = originalImageSizes[i].width;
+        }
+        if (imageTags[i].attribs.height === 'auto' && originalImageSizes[i].height) {
+            imageTags[i].attribs.height = originalImageSizes[i].height;
+        }
     }
-}
+}  // email-renderer.js:531-543
 ```
 
-#### 3. 语义化标签转 `<div>`
+#### 3. 强制所有链接在新窗口打开
+
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:545-546`
 
 ```javascript
-// Outlook、Yahoo 不支持 <figure> 和 <figcaption>
+$('a').attr('target', '_blank');
+```
+
+#### 4. 语义化标签转 `<div>`
+
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:548-549`
+
+```javascript
+// convert figure and figcaption to div so that Outlook applies margins
 $('figure, figcaption').each((i, elem) => !!(elem.tagName = 'div'));
 ```
 
-#### 4. 特殊字符转义（Outlook 兼容）
+**原因**：Outlook、Yahoo 等客户端对 `<figure>` 和 `<figcaption>` 的 margin 支持有问题。
+
+#### 5. 暗色/亮色模式图片切换
+
+**文件**：`ghost/core/core/server/services/email-renderer.js:551-560`
 
 ```javascript
+// Remove duplicate black/white images (CSS based solution not working in Outlook)
+if (templateData.backgroundIsDark) {
+    $('img.is-light-background').each((i, elem) => {
+        $(elem).remove();
+    });
+} else {
+    $('img.is-dark-background').each((i, elem) => {
+        $(elem).remove();
+    });
+}
+```
+
+**原因**：CSS 方案在 Outlook 中不生效，必须在 HTML 层面移除。
+
+#### 6. 特殊字符转义（Outlook 兼容）
+
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:573-578`
+
+```javascript
+// Fix any unsupported chars in Outlook
 html = html.replace(/&apos;/g, '&#39;');     // 单引号
 html = html.replace(/→/g, '&rarr;');          // 右箭头
 html = html.replace(/–/g, '&ndash;');         // 短破折号
@@ -806,9 +1137,9 @@ html = html.replace(/“/g, '&ldquo;');         // 左双引号
 html = html.replace(/”/g, '&rdquo;');         // 右双引号
 ```
 
-#### 5. Outlook 条件注释
+#### 7. Outlook 条件注释
 
-**模板**：`ghost/core/core/server/services/email-rendering/partials/email-wrapper.hbs`
+**文件**：`ghost/core/core/server/services/email-rendering/partials/email-wrapper.hbs`
 
 ```handlebars
 <!--[if mso]>
@@ -827,20 +1158,26 @@ html = html.replace(/”/g, '&rdquo;');         // 右双引号
     <center>
       <table border="0" cellpadding="0" cellspacing="0" width="600">
 <![endif]-->
+
+<!-- 实际内容 -->
+<tr>
+  <td class="wrapper" ...>
+    <table class="body" align="center" style="max-width:600px;">
+      ...
+    </table>
+  </td>
+</tr>
+
+<!-- Outlook 闭合标签 -->
+<!--[if mso]>
+      </table>
+    </center>
+  </td>
+</tr>
+<![endif]-->
 ```
 
-#### 6. 暗色/亮色模式图片切换
-
-```javascript
-// 根据背景色移除不匹配的图片
-if (templateData.backgroundIsDark) {
-    $('img.is-light-background').each((i, elem) => $(elem).remove());
-} else {
-    $('img.is-dark-background').each((i, elem) => $(elem).remove());
-}
-```
-
-#### 7. 响应式样式
+#### 8. 响应式样式
 
 **样式文件**：`ghost/core/core/server/services/email-service/email-templates/partials/styles.hbs`
 
@@ -883,34 +1220,39 @@ if (templateData.backgroundIsDark) {
 
 ### i18n 实例初始化
 
-**文件**：`ghost/core/core/server/services/email-service/email-service-wrapper.js:62-68`
+**文件**：`ghost/core/core/server/services/email-service/email-service-wrapper.js:62-95`
 
 ```javascript
-const i18nLanguage = settingsCache.get('locale') || 'en';
-const i18n = i18nLib(i18nLanguage, 'ghost');  // 使用 @tryghost/i18n
+// 从 settings 读取 locale（可能是 'en' 简写）
+const i18nLanguage = settingsCache.get('locale') || 'en';  // email-service-wrapper.js:62
+
+// 创建 i18n 实例
+const i18n = i18nLib(i18nLanguage, 'ghost');  // email-service-wrapper.js:63
 
 // 监听 locale 变化
 events.on('settings.locale.edited', (model) => {
     debug('locale changed, updating i18n to', model.get('value'));
-    i18n.changeLanguage(model.get('value'));
+    i18n.changeLanguage(model.get('value'));  // email-service-wrapper.js:69
 });
 
 // 注入 EmailRenderer
 const emailRenderer = new EmailRenderer({
+    settingsCache,
+    settingsHelpers,
     // ...
-    t: i18n.t,           // 真实的 i18n.t 函数
-    dir: i18n.dir.bind(i18n)  // i18n.dir 函数
+    t: i18n.t,           // email-service-wrapper.js:94 - 真实的 i18n.t 函数
+    dir: i18n.dir.bind(i18n)  // email-service-wrapper.js:95 - i18n.dir 函数
 });
 ```
 
 ### 占位函数 vs 真实翻译函数
 
-**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:26-34`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:26-48`
 
 ```javascript
 /**
  * Wrapper function so that i18next-parser can find these strings.
- * （仅用于静态分析提取翻译 key，不是实际运行时使用的函数）
+ * 仅用于静态分析提取翻译 key，不是实际运行时使用的函数！
  *
  * @template T
  * @param {T} x
@@ -918,8 +1260,9 @@ const emailRenderer = new EmailRenderer({
  */
 const t = (x) => {
     return x;
-};
+};  // email-renderer.js:33
 
+// 用占位函数提取翻译 key
 const messages = {
     subscriptionStatus: {
         free: '',
@@ -927,9 +1270,11 @@ const messages = {
         canceled: t('Your subscription has been canceled and will expire on {date}...'),
         active: t('Your subscription will renew on {date}.'),
         trial: t('Your free trial ends on {date}...'),
-        // ...
+        complimentaryExpires: t('Your subscription will expire on {date}.'),
+        complimentaryInfinite: '',
+        giftExpires: t('Your subscription will expire on {date}.')
     }
-};
+};  // email-renderer.js:36-48
 ```
 
 **关键区别**：
@@ -944,7 +1289,7 @@ const messages = {
 **文件**：`ghost/core/core/server/services/email-service/email-renderer.js:66-74, 271-284`
 
 ```javascript
-const DEFAULT_LOCALE = 'en-gb';
+const DEFAULT_LOCALE = 'en-gb';  // email-renderer.js:66
 
 function isValidLocale(locale) {
     try {
@@ -954,7 +1299,7 @@ function isValidLocale(locale) {
     } catch (e) {
         return false;
     }
-}
+}  // email-renderer.js:68-74
 
 #getValidLocale() {
     let locale = this.#settingsCache.get('locale') || DEFAULT_LOCALE;
@@ -964,11 +1309,11 @@ function isValidLocale(locale) {
     
     // 'en' 简写不被 Intl 完全支持，或 locale 无效 → 降级到 'en-gb'
     if (locale === 'en' || !isValidLocale(locale)) {
-        locale = DEFAULT_LOCALE;
+        locale = DEFAULT_LOCALE;  // email-renderer.js:280
     }
     
     return locale;
-}
+}  // email-renderer.js:272-284
 ```
 
 ### 日期本地化
@@ -988,40 +1333,53 @@ function formatDateLong(date, timezone, locale = DEFAULT_LOCALE) {
 }
 ```
 
-**使用示例**：`email-renderer.js:1031-1036`
+**使用示例**：`email-renderer.js:1031-1040`
 
 ```javascript
-const timezone = this.#settingsCache.get('timezone');
-const locale = this.#getValidLocale();
-const publishedAt = (post.get('published_at') ? DateTime.fromJSDate(post.get('published_at')) : DateTime.local())
-    .setZone(timezone)
-    .setLocale(locale)
-    .toLocaleString({
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
-    });
+async getTemplateData({post, newsletter, html, addPaywall, segment}) {
+    const timezone = this.#settingsCache.get('timezone');
+    const locale = this.#getValidLocale();
+    
+    const publishedAt = (post.get('published_at') 
+        ? DateTime.fromJSDate(post.get('published_at')) 
+        : DateTime.local())
+        .setZone(timezone)
+        .setLocale(locale)
+        .toLocaleString({
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric'
+        });  // email-renderer.js:1031-1040
+}
 ```
 
 ### RTL 方向支持
 
-**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:1124, 201, 238`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:201, 237-238, 1023-1024, 1124`
 
 ```javascript
-// 构造函数注入
+// 构造函数 JSDoc 说明
 /**
  * @param {(locale: string) => 'rtl' | 'ltr'} dependencies.dir 
  *        Returns 'rtl' or 'ltr' for a given locale (i18next's `i18n.dir`)
  */
-constructor({..., t, dir}) {
+
+// 构造函数注入
+constructor({
+    settingsCache,
+    settingsHelpers,
+    // ...
+    t,
+    dir  // email-renderer.js:237 - 注入
+}) {
     this.#t = t;
-    this.#dir = dir;
+    this.#dir = dir;  // email-renderer.js:238 - 赋值
 }
 
 // 使用
 async getTemplateData({post, newsletter, html, addPaywall, segment}) {
     const locale = this.#getValidLocale();
-    const direction = this.#dir(locale);  // 调用 i18n.dir()
+    const direction = this.#dir(locale);  // email-renderer.js:1024 - 调用 i18n.dir()
     
     const data = {
         site: {
@@ -1033,15 +1391,15 @@ async getTemplateData({post, newsletter, html, addPaywall, segment}) {
 }
 ```
 
-**模板应用**：`email-rendering/partials/email-wrapper.hbs`
+**模板应用**：`ghost/core/core/server/services/email-rendering/partials/email-wrapper.hbs`
 
 ```handlebars
 <html lang="{{site.locale}}" dir="{{site.direction}}">
 ```
 
-**样式中的 RTL 调整**：`email-templates/partials/styles.hbs`
+**样式中的 RTL 调整**：`ghost/core/core/server/services/email-service/email-templates/partials/styles.hbs`
 
-```css
+```handlebars
 .manage-subscription {
     text-align: {{#if (eq site.direction "rtl")}}left{{else}}right{{/if}};
 }
@@ -1068,7 +1426,13 @@ getMemberStatusText(member) {
     }
 
     if (member.status === 'paid') {
-        // ...
+        let activeSubscription = member.subscriptions.find((subscription) => {
+            return subscription.status === 'trialing' || subscription.status === 'active';
+        });
+        if (!activeSubscription) {
+            return '';
+        }
+        
         if (activeSubscription.trial_end_at && activeSubscription.trial_end_at > new Date()) {
             const date = formatDateLong(activeSubscription.trial_end_at, timezone, locale);
             return t(messages.subscriptionStatus.trial, {date});
@@ -1080,38 +1444,58 @@ getMemberStatusText(member) {
         }
         return t(messages.subscriptionStatus.active, {date});
     }
+
+    if (member.status === 'comped') {
+        const expires = member.tiers[0]?.expiry_at ?? null;
+        if (expires) {
+            const timezone = this.#settingsCache.get('timezone');
+            const date = formatDateLong(expires, timezone, locale);
+            return t(messages.subscriptionStatus.complimentaryExpires, {date});
+        }
+        return t(messages.subscriptionStatus.complimentaryInfinite);
+    }
+
+    return '';
 }
 ```
 
 ### 状态变量翻译
 
-**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:776-786`
+**文件**：`ghost/core/core/server/services/email-service/email-renderer.js:719, 776-786`
 
 ```javascript
-{
-    id: 'status',
-    getValue: (member) => {
-        if (member.status === 'comped') {
-            return t('complimentary');
+buildReplacementDefinitions({html, newsletterUuid}) {
+    const t = this.#t;           // email-renderer.js:720 - 真实的 i18n.t
+    const locale = this.#getValidLocale();
+
+    const baseDefinitions = [
+        // ...
+        {
+            id: 'status',
+            getValue: (member) => {
+                if (member.status === 'comped') {
+                    return t('complimentary');  // email-renderer.js:778
+                }
+                if (this.isMemberTrialing(member)) {
+                    return t('trialing');  // email-renderer.js:781
+                }
+                // other possible statuses: t('free'), t('paid')
+                return t(member.status);  // email-renderer.js:785
+            }
         }
-        if (this.isMemberTrialing(member)) {
-            return t('trialing');
-        }
-        // other possible statuses: t('free'), t('paid')
-        return t(member.status);
-    }
+    ];
 }
 ```
 
 ### 多语言兜底总结
 
-| 场景 | 处理方式 | 示例 |
-|------|----------|------|
-| settings 存 `'en'` 简写 | `#getValidLocale()` 降级 | `'en'` → `'en-gb'` |
-| locale 无效 | `#getValidLocale()` 降级 | `'invalid'` → `'en-gb'` |
-| 文本翻译 | `i18n.t()` 执行 | `t('complimentary')` |
-| 日期格式 | Luxon `setLocale()` | `setLocale('zh-cn')` |
-| 文本方向 | `i18n.dir()` | `'ar'` → `'rtl'` |
+| 场景 | 处理方式 | 文件 | 行号 | 示例 |
+|------|----------|------|------|------|
+| settings 存 `'en'` 简写 | `#getValidLocale()` 降级 | `email-renderer.js` | 278-280 | `'en'` → `'en-gb'` |
+| locale 无效 | `#getValidLocale()` 降级 | `email-renderer.js` | 278-280 | `'invalid'` → `'en-gb'` |
+| 文本翻译 | `i18n.t()` 执行 | `email-renderer.js` | 720, 778, 781 | `t('complimentary')` |
+| 日期格式 | Luxon `setLocale()` | `email-renderer.js` | 82-88 | `setLocale('zh-cn')` |
+| 文本方向 | `i18n.dir()` | `email-renderer.js` | 1024 | `'ar'` → `'rtl'` |
 
 ---
 
@@ -1121,10 +1505,10 @@ getMemberStatusText(member) {
 
 | 文件 | 职责 |
 |------|------|
-| `ghost/core/core/server/services/email-service/email-service-wrapper.js` | 依赖注入、i18n 初始化 |
+| `ghost/core/core/server/services/email-service/email-service-wrapper.js` | 依赖注入、i18n 初始化、事件监听 |
 | `ghost/core/core/server/services/email-service/email-renderer.js` | 邮件渲染核心（模板、变量、兼容处理） |
 | `ghost/core/core/server/services/email-service/sending-service.js` | 发送协调（缓存、收件人构建） |
-| `ghost/core/core/server/services/email-service/batch-sending-service.js` | 批量调度（分批、并发、重试） |
+| `ghost/core/core/server/services/email-service/batch-sending-service.js` | 批量调度（分批、并发、重试、域名预热） |
 
 ### 设计计算
 
@@ -1150,63 +1534,3 @@ getMemberStatusText(member) {
 | `ghost/core/test/unit/server/services/email-rendering/email-design.test.js` | 验证语义值被视为无效 HEX |
 | `ghost/core/test/unit/server/services/email-service/batch-sending-service.test.js` | 批量发送单元测试 |
 | `ghost/core/test/integration/services/email-service/batch-sending.test.js` | 批量发送集成测试 |
-
----
-
-## 关键偏差修正说明
-
-### 偏差 1：语义值 vs HEX 颜色
-
-**原描述**：Newsletter 模型默认值 `background_color: 'light'` 直接传递给 `getEmailDesign()`
-
-**修正**：
-- Newsletter 模型存储语义值 `'light'`、`'transparent'`、`'accent'`
-- `email-design.js` 的 `getHexColor()` 只接受 `#xxx` 格式，`'light'` 被视为无效值
-- 实际转换：管理端预览组件独立实现语义值 → HEX 的映射
-- 邮件渲染端：`'light'` 因验证失败回退到 `#ffffff`
-
-**证据**：
-- `email-design.test.js` 中 `'light'` 被列在 `INVALID_HEX_COLORS`
-- `newsletter.js:30` 定义 `background_color: 'light'`
-- `email-design.js:76` 调用 `getHexColor(settings.backgroundColor, '#ffffff')`
-
-### 偏差 2：`#t` 函数来源
-
-**原描述**：`#t` 是文件顶部的占位函数
-
-**修正**：
-- 文件顶部的 `const t = (x) => x` 是占位函数，仅用于 i18next-parser 静态分析提取翻译 key
-- 实际运行时使用的是构造函数注入的 `this.#t = i18n.t`（`@tryghost/i18n` 实例）
-
-**证据**：
-- `email-service-wrapper.js:94` 注入 `t: i18n.t`
-- `email-renderer.js:237` 赋值 `this.#t = t`
-- `email-renderer.js:32` 注释明确说明是 wrapper for i18next-parser
-
-### 偏差 3：版式共享机制
-
-**原描述**：前后端共享同一 `getEmailDesign` 函数
-
-**修正**：
-- 前后端不共享计算函数
-- 后端：`email-design.js` 的 `getEmailDesign()` 只处理 HEX 颜色
-- 前端：`newsletter-preview.tsx` 独立实现语义值 → HEX 转换
-- 共享的是**规则**（`'accent'` → 站点主色、`null` → 背景对比色），不是代码
-
-**证据**：
-- 后端 `getEmailDesign()` 不导入任何前端文件
-- 前端 `newsletter-preview.tsx` 自己实现 `backgroundColor()`、`buttonColor()` 等函数
-- 单元测试验证语义值在后端被视为无效
-
-### 偏差 4：locale 处理
-
-**原描述**：settingsCache 直接存完整 locale
-
-**修正**：
-- settingsCache 可能存 `'en'` 简写（用户配置）
-- `#getValidLocale()` 验证后降级到 `'en-gb'`
-- 两层 locale：settings 层（用户输入）和渲染层（验证后）
-
-**证据**：
-- `email-service-wrapper.js:62` 使用 `settingsCache.get('locale') || 'en'`
-- `email-renderer.js:278-280` 检查 `if (locale === 'en' || !isValidLocale(locale))`
