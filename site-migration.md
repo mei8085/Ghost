@@ -2,589 +2,746 @@
 
 ## 一、一键导出的快照范围
 
-### 1.1 默认导出范围 (TABLES_ALLOWLIST)
+### 1.1 导出功能定位
 
-默认的 "一键导出" 功能导出以下表的数据，位于 `ghost/core/core/server/data/exporter/table-lists.js:69-90`:
+Ghost 的站点级导出是 **纯数据库快照导出**，**不包含任何图片、附件或媒体文件**。
 
-**核心内容表：**
-- `posts` - 文章/页面
+**代码证据：**
+
+- 导出核心 `ghost/core/core/server/data/exporter/exporter.js:33-68` 仅执行数据库表查询
+- API 端点 `ghost/core/core/server/api/endpoints/db.js:39-77` 的 `exportContent` 直接返回 JSON 数据
+- 前端调用 `apps/admin-x-framework/src/api/db.ts:19` 通过 `downloadFromEndpoint('/db/')` 下载 JSON 文件
+
+### 1.2 何时需要 Zip 资源包
+
+| 场景 | 导出格式 | 是否包含资源 |
+|------|----------|-------------|
+| 一键导出（Admin UI "Content & settings" 按钮） | 单个 `.json` 文件 | ❌ 仅数据库数据 |
+| 跨实例迁移（包含图片） | 需要 **手动打包** `images/` + `media/` + `files/` + `.json` 为 `.zip` | ✅ 需用户手动准备 |
+| 导入支持 | `.json` 或 `.zip` | ✅ zip 可包含资源目录 |
+
+**关键结论：**
+
+1. **导出侧** - Ghost 官方导出功能 **不提供 zip 资源包导出**，只输出 JSON 数据库快照
+2. **导入侧** - 支持两种格式：
+   - 纯 JSON 文件（仅结构数据迁移）
+   - ZIP 压缩包（JSON + `images/` + `media/` + `files/` 目录）
+
+### 1.3 默认导出的数据库表 (TABLES_ALLOWLIST)
+
+位于 `ghost/core/core/server/data/exporter/table-lists.js:69-90`，共 21 张表：
+
+**内容核心：**
+- `posts` - 文章/页面（含 html、mobiledoc、feature_image 等字段）
 - `posts_authors` - 文章-作者关联
 - `posts_meta` - 文章元数据
 - `posts_tags` - 文章-标签关联
 - `posts_products` - 文章-产品关联
+- `tags` - 标签定义
 
 **用户与权限：**
+- `users` - 用户数据（含 profile_image、cover_image 字段）
 - `roles` - 角色定义
 - `roles_users` - 用户-角色关联
-- `users` - 用户数据
 
-**标签与分类：**
-- `tags` - 标签
-
-**设置与配置：**
-- `settings` - 站点设置 (部分敏感配置被过滤)
+**站点配置：**
+- `settings` - 站点设置（敏感项已过滤）
 - `custom_theme_settings` - 主题自定义设置
 
-**会员与产品：**
+**会员与商业化：**
 - `products` - 产品/套餐
 - `stripe_products` - Stripe 产品映射
 - `stripe_prices` - Stripe 价格配置
 - `newsletters` - 通讯
 - `benefits` - 权益
 - `products_benefits` - 产品-权益关联
-
-**营销相关：**
 - `offers` - 优惠码
 - `offer_redemptions` - 优惠码兑换记录
 - `snippets` - 代码片段
 
-### 1.2 可选备份表 (BACKUP_TABLES)
+### 1.4 可选备份表 (BACKUP_TABLES)
 
-通过 API 的 `include` 参数可以额外导出以下表，位于 `ghost/core/core/server/data/exporter/table-lists.js:2-64`:
+通过 API 的 `include` 参数可额外导出 64 张表，位于 `table-lists.js:2-64`：
 
-**安全与认证：**
-- `api_keys` - API 密钥
-- `integrations` - 集成配置
-- `invites` - 邀请记录
-- `tokens` - Token
-- `sessions` - 会话
-- `brute` - 暴力破解防护记录
-- `actions` - 操作日志
+**安全与认证类：**
+- `api_keys`, `integrations`, `invites`, `tokens`, `sessions`, `brute`, `actions`
 
-**会员与订阅：**
-- `members` - 会员数据
-- `members_labels` - 会员标签
-- `members_products` - 会员-产品关联
-- `members_stripe_customers` - 会员-Stripe 映射
-- `members_stripe_customers_subscriptions` - 会员订阅
-- `subscriptions` - 订阅记录
-- `members_cancel_events` - 会员取消事件
-- `members_payment_events` - 支付事件
-- `members_login_events` - 登录事件
-- `members_email_change_events` - 邮箱变更事件
-- `members_status_events` - 状态变更事件
-- `members_paid_subscription_events` - 付费订阅事件
-- `members_subscribe_events` - 订阅事件
-- `members_product_events` - 产品事件
-- `members_created_events` - 创建事件
-- `members_subscription_created_events` - 订阅创建事件
-- `members_newsletters` - 会员-通讯关联
-- `members_click_events` - 点击事件
-- `members_feedback` - 会员反馈
+**会员与订阅类：**
+- `members`, `members_labels`, `members_products`, `members_stripe_customers`, `subscriptions`
+- 各类会员事件表（取消、支付、登录、邮箱变更、状态变更等）
+- `members_newsletters`, `members_click_events`, `members_feedback`
 
-**邮件相关：**
-- `emails` - 发送的邮件
-- `email_batches` - 邮件批次
-- `email_recipients` - 邮件接收者
-- `email_recipient_failures` - 发送失败记录
-- `email_design_settings` - 邮件设计设置
-- `automated_email_recipients` - 自动化邮件接收者
-- `welcome_email_automations` - 欢迎邮件自动化
-- `welcome_email_automation_runs` - 欢迎邮件自动化运行记录
-- `welcome_email_automated_emails` - 欢迎自动化邮件
+**邮件与通讯类：**
+- `emails`, `email_batches`, `email_recipients`, `email_recipient_failures`
+- `email_design_settings`, `automated_email_recipients`
+- 欢迎邮件自动化相关表
 
-**内容历史：**
-- `mobiledoc_revisions` - Mobiledoc 修订
-- `post_revisions` - 文章修订
-
-**评论与互动：**
-- `comments` - 评论
-- `comment_likes` - 评论点赞
-- `comment_reports` - 评论举报
-- `mentions` - 提及
+**内容历史与互动：**
+- `mobiledoc_revisions`, `post_revisions`
+- `comments`, `comment_likes`, `comment_reports`, `mentions`
 
 **社交与推荐：**
-- `recommendations` - 推荐
-- `recommendation_click_events` - 推荐点击事件
-- `recommendation_subscribe_events` - 推荐订阅事件
-- `outbox` - ActivityPub 发件箱
+- `recommendations`, `recommendation_click_events`, `recommendation_subscribe_events`, `outbox`
 
 **其他：**
-- `donation_payment_events` - 捐赠支付事件
-- `suppressions` - 邮件抑制列表
-- `email_spam_complaint_events` - 垃圾邮件投诉事件
-- `milestones` - 里程碑
-- `collections` - 集合
-- `collections_posts` - 集合-文章关联
-- `gifts` - 礼品
-- `labels` - 标签 (会员用)
-- `redirects` - 重定向
-- `jobs` - 后台任务
-- `migrations` - 迁移记录
-- `migrations_lock` - 迁移锁
-- `permissions` - 权限
-- `permissions_roles` - 权限-角色关联
-- `permissions_users` - 权限-用户关联
-- `webhooks` - Webhook
+- `donation_payment_events`, `suppressions`, `email_spam_complaint_events`
+- `milestones`, `collections`, `collections_posts`
+- `gifts`, `labels`, `redirects`, `jobs`
+- `migrations`, `migrations_lock`, `permissions`, `webhooks`
 
-### 1.3 敏感配置过滤
+### 1.5 敏感配置过滤 (SETTING_KEYS_BLOCKLIST)
 
-导出时会过滤以下设置项 (`SETTING_KEYS_BLOCKLIST`)，位于 `ghost/core/core/server/data/exporter/table-lists.js:93-104`:
+导出时自动过滤以下设置项，位于 `table-lists.js:93-104`：
 
-- `stripe_connect_publishable_key`
-- `stripe_connect_secret_key`
-- `stripe_connect_account_id`
-- `stripe_secret_key`
-- `stripe_publishable_key`
-- `stripe_billing_portal_configuration_id`
-- `members_stripe_webhook_id`
-- `members_stripe_webhook_secret`
-- `email_verification_required`
-- `indexnow_api_key`
+| 设置键 | 过滤原因 |
+|--------|----------|
+| `stripe_connect_publishable_key` | Stripe 凭证 |
+| `stripe_connect_secret_key` | Stripe 凭证 |
+| `stripe_connect_account_id` | Stripe 凭证 |
+| `stripe_secret_key` | Stripe 凭证 |
+| `stripe_publishable_key` | Stripe 凭证 |
+| `stripe_billing_portal_configuration_id` | Stripe 配置 |
+| `members_stripe_webhook_id` | Webhook 配置 |
+| `members_stripe_webhook_secret` | Webhook 密钥 |
+| `email_verification_required` | 运行时状态 |
+| `indexnow_api_key` | 第三方服务密钥 |
 
-### 1.4 导出格式
+### 1.6 导出格式
 
-导出数据为 JSON 格式，结构如下：
-
+**API 响应结构：**
 ```json
 {
-  "meta": {
-    "exported_on": 1699999999999,
-    "version": "5.0.0"
-  },
-  "data": {
-    "posts": [...],
-    "users": [...],
-    "tags": [...],
-    ...
-  }
+  "db": [{
+    "meta": {
+      "exported_on": 1699999999999,
+      "version": "5.75.0"
+    },
+    "data": {
+      "posts": [...],
+      "users": [...],
+      "tags": [...],
+      "settings": [...],
+      ...
+    }
+  }]
 }
 ```
 
-文件名格式: `{站点标题}.ghost.{YYYY-MM-DD-HH-mm-ss}.json`
+**文件名格式：** `{站点标题}.ghost.{YYYY-MM-DD-HH-mm-ss}.json`
 
 ---
 
-## 二、跨实例导入时的标识重映射
+## 二、导入系统架构与主流程
 
-### 2.1 整体流程
+### 2.1 核心组件：Handlers vs Importers
 
-导入管理器 (`ImportManager`) 位于 `ghost/core/core/server/data/importer/import-manager.js`，处理流程为 6 个步骤：
+导入管理器 `ImportManager` 位于 `ghost/core/core/server/data/importer/import-manager.js`，包含两套组件：
 
-1. **loadFile** - 加载文件 (支持 zip 或单个 json)
-2. **preProcess** - 预处理 (替换资源路径等)
-3. **doImport** - 实际导入数据
-4. **generateReport** - 生成报告
-5. **cleanUp** - 清理临时文件
-6. **发送完成邮件**
+**Handlers（文件加载器）** - 负责从 zip 或文件中读取原始数据，输出结构化的 `importData`：
 
-### 2.2 数据导入器架构
+| Handler | type | 处理内容 | 输出 |
+|---------|------|----------|------|
+| `JSONHandler` | `data` | `.json` 文件 | 解析后的数据库结构 `{meta, data}` |
+| `MarkdownHandler` | `data` | `.md` 文件 | 转换为 `{meta: {}, data: {posts: []}}` |
+| `RevueHandler` | `revue` | Revue 导出 csv/json | `{meta: {revue: true}, revue: {...}}` |
+| `ImageHandler` | `images` | 图片文件 | 文件元数据数组 `[{name, path, originalPath, newPath, targetDir}]` |
+| `mediaHandler` | `media` | 媒体文件 | 同上格式 |
+| `filesHandler` | `files` | 文件附件 | 同上格式 |
 
-数据导入由 `DataImporter` (`ghost/core/core/server/data/importer/importers/data/data-importer.js`) 协调，使用 8 个专用导入器按顺序处理：
+**Importers（数据导入器）** - 负责将 `importData` 中的数据实际写入 Ghost：
 
-1. `UsersImporter` - 用户
-2. `RolesImporter` - 角色
-3. `TagsImporter` - 标签
-4. `NewslettersImporter` - 通讯
-5. `SettingsImporter` - 设置
-6. `ProductsImporter` - 产品
-7. `StripeProductsImporter` - Stripe 产品
-8. `StripePricesImporter` - Stripe 价格
-9. `PostsImporter` - 文章
-10. `CustomThemeSettingsImporter` - 主题设置
-11. `RevueSubscriberImporter` - Revue 订阅者
+| Importer | type | 职责 |
+|----------|------|------|
+| `ContentFileImporter` (x3) | `images`/`media`/`files` | 保存资源文件到存储，预处理路径替换 |
+| `RevueImporter` | `revue` | 将 Revue 数据转换为 Ghost 格式 |
+| `DataImporter` | `data` | 协调 11 个子 importer 导入数据库结构 |
 
-### 2.3 ID 生成与映射
+### 2.2 完整导入主流程
 
-**新 ID 生成** (`base.js:89-99`):
+`import-manager.js:494-552` 的 `importFromFile()` 主流程：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Step 1: loadFile()                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Zip 解压 → 遍历所有 Handlers → 生成 importData          │   │
+│  │ importData = {                                          │   │
+│  │   data: {meta: {...}, data: {posts: [...], ...}},       │   │
+│  │   images: [{name, path, originalPath, newPath, ...}],   │   │
+│  │   media: [...],                                         │   │
+│  │   files: [...]                                          │   │
+│  │ }                                                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Step 2: preProcess()                        │
+│  按顺序遍历所有 Importers:                                       │
+│  ① imageImporter.preProcess → 替换 posts/tags/users 中的图片引用│
+│  ② mediaImporter.preProcess → 替换 posts 中的媒体引用           │
+│  ③ filesImporter.preProcess → 替换 posts 中的文件引用           │
+│  ④ RevueImporter.preProcess → 将 revue 数据转为 Ghost 格式      │
+│  ⑤ DataImporter.preProcess → 仅标记 preProcessedByData=true     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Step 3: doImport()                          │
+│  按顺序遍历所有 Importers:                                       │
+│  ① imageImporter.doImport → 保存图片到存储 ❌ 无事务保护         │
+│  ② mediaImporter.doImport → 保存媒体到存储 ❌ 无事务保护         │
+│  ③ filesImporter.doImport → 保存附件到存储 ❌ 无事务保护         │
+│  ④ RevueImporter.doImport → 空操作 (数据已在 preProcess 转换)   │
+│  ⑤ DataImporter.doImport → 数据库事务内导入结构数据 ✅ 事务保护  │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Step 4-6: 收尾                               │
+│  generateReport() → cleanUp() → 发送邮件通知                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.3 Step 1: loadFile() 详解
+
+**Zip 处理流程** (`import-manager.js:304-340`):
+
+1. 解压到临时目录 `os.tmpdir()/randomUUID/`
+2. 按 Handlers 数组顺序遍历：
+   - `ImageHandler` 匹配 `images/` 或 `content/` 目录下的图片
+   - `mediaHandler` 匹配 `media/` 或 `content/` 目录下的媒体
+   - `filesHandler` 匹配 `files/` 或 `content/` 目录下的附件
+   - `RevueHandler` 检测是否有 `issues*.csv`
+   - `JSONHandler` 匹配 `.json` 文件
+   - `MarkdownHandler` 匹配 `.md/.markdown` 文件
+3. 每种 type 只能有一个 handler 匹配（否则抛 `zipContainsMultipleDataFormats` 错误）
+
+**Handler 的 loadFile 做什么？**
+
+以 `ImageHandler` (`handlers/image.js:14-45`) 为例：
+- **不保存文件**，只做路径规划
+- 调用 `storage.getUniqueFileName()` 生成不冲突的目标文件名
+- 计算 `newPath`（最终 URL 路径）和 `targetDir`（存储目录）
+- 返回文件元数据数组供后续使用
+
+### 2.4 Step 2: preProcess() 详解
+
+**关键：资源路径替换发生在此阶段**
+
+`ContentFileImporter.preProcess()` (`importers/content-file-importer.js:74-110`):
+
 ```javascript
-generateIdentifier() {
-    _.each(this.dataToImport, (obj) => {
-        const newId = ObjectId().toHexString();
-        if (obj.id) {
-            this.originalIdMap[newId] = obj.id;  // 保存原始ID映射
-        }
-        obj.id = newId;  // 替换为新ID
+// images 类型的处理逻辑
+if (importData.images && importData.data && importData.data.data) {
+    _.each(importData.images, function (image) {
+        preProcessPosts(importData.data.data, image);  // 替换 posts 中的引用
+        preProcessTags(importData.data.data, image);   // 替换 tags 中的引用
+        preProcessUsers(importData.data.data, image);  // 替换 users 中的引用
     });
 }
 ```
-
-每个导入对象都会生成新的 ObjectId，同时通过 `originalIdMap` 保存 `新ID → 原始ID` 的映射关系。
-
-### 2.4 用户引用重映射
-
-用户引用处理位于 `base.js:184-304`，`replaceIdentifiers()` 方法处理以下字段：
-- `author_id`
-- `published_by`
-
-**解析策略（优先级从高到低）：**
-
-1. **空值处理** - 如果引用为空，fallback 到当前站点的 Owner 用户
-2. **文件内匹配** - 在导入文件的 users 数据中查找
-3. **已导入用户匹配** - 通过 email 查找已导入的用户 (因为 slug 可能在插入时变化)
-4. **数据库已有用户匹配** - 先按 slug 查找，再按 ID 查找
-5. **最终 fallback** - 如果都找不到，使用 Owner 用户
-
-### 2.5 文章关系重映射
-
-`PostsImporter.replaceIdentifiers()` (`posts-importer.js:116-214`) 处理：
-
-**标签关系 (posts_tags → tags):**
-- 先在导入文件的 tags 中查找
-- 再通过 `originalId` 在已导入数据中匹配
-- 最后在数据库现有 tags 中按 slug 查找
-
-**作者关系 (posts_authors → users):**
-- 同样的多级匹配策略
-- 特殊处理：如果所有作者都无法匹配，fallback 到 Owner 用户（因为文章必须至少有一个作者）
-
-**产品关系 (posts_products → products):**
-- 类似的匹配逻辑
-
-**通讯关联 (newsletter_id):**
-- 查找已导入的 newsletters
-- 如果在导入文件中存在但未导入，删除该引用
-
-### 2.6 Stripe 循环引用修复
-
-Stripe 存在循环引用问题 (`posts-importer.js:155-182`):
-
-```
-stripe_prices → stripe_products → products → stripe_prices
-```
-
-修复策略：
-1. 先导入所有数据
-2. 在导入序列最后，专门处理 products 的 `monthly_price_id` 和 `yearly_price_id`
-3. 通过 `originalId` 查找已导入的 stripe_prices，更新 products 表
-
-### 2.7 角色处理
-
-`UsersImporter` (`users-importer.js:31-88`) 的特殊处理：
-
-- **Owner 角色不导入** - 导入时将 Owner 角色转换为 Administrator
-- **员工限制处理** - 如果站点有员工数量限制，所有导入用户角色设为 Contributor
-- **角色匹配** - 通过角色名称匹配，而非 ID
-
----
-
-## 三、图片与附件资源迁移
-
-### 3.1 资源导入器
-
-`ImportManager` 初始化了三个内容文件处理器 (`import-manager.js:58-96`):
-
-1. **ImageHandler** - 处理图片
-   - 目录: `images/`, `content/`
-   - 使用 imageStorage 适配器
-
-2. **mediaHandler** (ImporterContentFileHandler) - 处理媒体文件
-   - 目录: `media/`, `content/`
-   - 使用 mediaStorage 适配器
-
-3. **filesHandler** (ImporterContentFileHandler) - 处理通用文件
-   - 目录: `files/`, `content/`
-   - 使用 fileStorage 适配器
-
-### 3.2 资源文件处理流程
-
-**Step 1: 路径规范化** (`importer-content-file-handler.js:38-79`):
-
-```javascript
-// 1. 移除 zip 基础目录前缀
-const noBaseDir = file.name.replace(baseDirRegex, '');
-
-// 2. 移除 Ghost 特定目录前缀 (如 content/images/)
-let noGhostDirs = noBaseDir;
-_.each(contentFilesFolderRegexes, function (regex) {
-    noGhostDirs = noGhostDirs.replace(regex, '');
-});
-
-// 3. 生成目标路径
-file.originalPath = noBaseDir;  // 原始路径，用于内容替换
-file.name = noGhostDirs;
-file.targetDir = path.dirname(noGhostDirs);
-```
-
-**Step 2: 生成唯一文件名**
-
-使用 storage 适配器的 `getUniqueFileName()` 方法避免冲突。
-
-**Step 3: 生成新 URL**
-
-```javascript
-file.newPath = urlUtils.urlJoin(
-    '/',
-    urlUtils.getSubdir(),
-    storage.staticFileURLPrefix,
-    targetFilename
-);
-```
-
-### 3.3 内容中的资源引用替换
-
-`ContentFileImporter.preProcess()` (`content-file-importer.js:74-110`) 在导入数据前进行路径替换：
-
-**替换范围：**
-
-1. **Posts 中的图片引用**:
-   - `post.markdown` - Markdown 内容
-   - `post.html` - HTML 内容
-   - `post.feature_image` - 特色图片
-
-2. **Tags 中的图片引用**:
-   - `tag.feature_image`
-
-3. **Users 中的图片引用**:
-   - `user.cover_image` - 封面图
-   - `user.profile_image` - 头像
 
 **替换逻辑** (`content-file-importer.js:7-16`):
 
 ```javascript
 replaceImage = function (markdown, image) {
-    if (!markdown) {
-        return;
-    }
-    // 匹配原始路径，支持可选的前导斜杠
     const regex = new RegExp('(/)?' + image.originalPath, 'gm');
     return markdown.replace(regex, image.newPath);
 };
 ```
 
-### 3.4 资源文件存储
+**替换范围：**
 
-`ContentFileImporter.doImport()` (`content-file-importer.js:117-125`):
+| 数据类型 | 字段 |
+|----------|------|
+| posts | `markdown`, `html`, `feature_image` |
+| tags | `feature_image` |
+| users | `profile_image`, `cover_image` |
 
+### 2.5 Step 3: doImport() 详解
+
+**按 importers 数组顺序执行** (`import-manager.js:101`):
+```javascript
+this.importers = [
+    imageImporter,        // ① 保存图片
+    mediaImporter,        // ② 保存媒体
+    contentFilesImporter, // ③ 保存附件
+    RevueImporter,        // ④ 空操作
+    DataImporter          // ⑤ 数据库导入
+];
+```
+
+**①-③ 资源文件保存** (`content-file-importer.js:117-125`):
 ```javascript
 doImport(contentFilesData) {
     return Promise.all(contentFilesData.map(function (contentFile) {
-        return store.save(contentFile, contentFile.targetDir).then(function (result) {
-            return {
-                originalPath: contentFile.originalPath,
-                newPath: contentFile.newPath,
-                stored: result
-            };
-        });
+        return store.save(contentFile, contentFile.targetDir);  // 直接写入存储
     }));
 }
 ```
+- 无事务保护
+- 无回滚机制
+- 失败后已保存的文件保留
 
-### 3.5 支持的 Zip 结构
-
-导入器支持以下 zip 结构：
-
-1. **根目录直接放置** - JSON 文件和 images/ 等目录在 zip 根目录
-2. **单层基础目录** - 所有内容在一个子目录内
-
-zip 内的目录名可以是：
-- `images/` - 图片
-- `media/` - 媒体文件
-- `files/` - 文件附件
-- `content/` - 通用内容目录
+**⑤ DataImporter 数据库导入** - 见下一节详细分析
 
 ---
 
-## 四、失败时的回滚边界
+## 三、DataImporter 的标识重映射机制
 
-### 4.1 数据库事务边界
+### 3.1 DataImporter 内部架构
 
-**数据导入的事务范围** (`data-importer.js:124-197`):
+`DataImporter.doImport()` (`importers/data/data-importer.js:50-198`) 协调 11 个子 importer：
+
+```
+执行顺序（由初始化顺序决定）:
+1. UsersImporter       → 导入用户
+2. RolesImporter       → 导入角色
+3. TagsImporter        → 导入标签
+4. NewslettersImporter → 导入通讯
+5. SettingsImporter    → 导入设置
+6. ProductsImporter    → 导入产品
+7. StripeProductsImporter → Stripe 产品映射
+8. StripePricesImporter   → Stripe 价格
+9. PostsImporter       → 导入文章（最复杂的关联处理）
+10. CustomThemeSettingsImporter → 主题设置
+11. RevueSubscriberImporter → Revue 订阅者
+```
+
+### 3.2 数据库事务边界
+
+**所有子 importer 的操作都在同一个事务内** (`data-importer.js:124-197`):
 
 ```javascript
 return models.Base.transaction(async function (transacting) {
     modelOptions.transacting = transacting;
-    
-    // 所有导入操作在同一个事务中
-    await sequence(ops);  // 顺序执行所有 importer
-    
-    // 检查错误
+
+    // 所有操作共享同一个 transacting
+    await sequence(ops);  // 顺序执行所有子 importer
+
     if (errors.length > 0) {
-        debug(errors);
-        throw errors;  // 抛出错误触发回滚
+        throw errors;  // 触发事务回滚
     }
-    
+
     return { ... };
 });
 ```
 
-**事务包含的操作：**
-- 所有 importer 的 `fetchExisting`, `beforeImport`, `replaceIdentifiers`, `doImport`
-- Stripe 循环引用修复
+### 3.3 每个子 importer 的执行流程
 
-**事务回滚触发条件：**
-- 任何 importer 产生 `errors` (注意：不是 `problems`)
-- 未捕获的异常
+在事务内，每个子 importer 按以下顺序执行 (`data-importer.js:127-152`):
 
-### 4.2 错误分类
-
-**Errors 与 Problems 的区别** (`base.js:111-174`):
-
-| 类型 | 处理方式 | 例子 |
-|------|----------|------|
-| **Errors** | 阻止导入，触发事务回滚 | 数据验证失败、重复数据（当 `allowDuplicates=false`） |
-| **Problems** | 仅记录警告，不影响导入继续 | 日期格式错误（自动修复）、用户引用找不到（fallback 到 Owner）、重复条目（被忽略） |
-
-**常见 Problems：**
-- 日期格式错误 → 使用当前时间戳
-- 用户引用找不到 → fallback 到 Owner
-- 重复的 slug → 忽略重复项
-- 找不到关联的 tag/author → 移除关联或 fallback
-
-### 4.3 资源文件的回滚边界
-
-**关键发现：图片/媒体文件导入不在数据库事务内**
-
-导入执行顺序 (`import-manager.js:494-552`):
-
-```javascript
-async importFromFile(file, importOptions) {
-    // Step 1: 加载文件
-    importData = await this.loadFile(file);
-    
-    // Step 2: 预处理 (替换内容中的路径引用)
-    importData = await this.preProcess(importData);
-    
-    // Step 3: 执行导入
-    importResult = await this.doImport(importData, importOptions);
-    
-    // Step 5: 清理
-    await this.cleanUp();
-}
+```
+1. fetchExisting()    → 从数据库读取已有数据（用于冲突检测和匹配）
+2. beforeImport()     → 数据清洗、ID 重新生成、关联构建
+3. 依赖注入           → requiredImportedData / requiredExistingData
+4. replaceIdentifiers() → 外键引用重映射
+5. doImport()         → 实际写入数据库
 ```
 
-**doImport 中的 importer 执行顺序** (`import-manager.js:101`):
-```javascript
-this.importers = [
-    imageImporter,        // 1. 先保存图片到存储
-    mediaImporter,        // 2. 保存媒体文件
-    contentFilesImporter, // 3. 保存文件附件
-    RevueImporter,
-    DataImporter          // 4. 最后才在数据库事务中导入结构数据
-];
-```
+### 3.4 ID 重新生成
 
-**回滚边界结论：**
+**在 `beforeImport()` 阶段**，所有对象获得新的 ObjectId。
 
-| 组件 | 事务保护 | 失败后状态 |
-|------|----------|-----------|
-| 图片文件 (imageImporter) | ❌ 无 | 已保存的文件不会回滚 |
-| 媒体文件 (mediaImporter) | ❌ 无 | 已保存的文件不会回滚 |
-| 文件附件 (filesImporter) | ❌ 无 | 已保存的文件不会回滚 |
-| 结构数据 (DataImporter) | ✅ 有 | 完全回滚 |
-
-### 4.4 清理机制
-
-**临时文件清理** (`import-manager.js:441-457`):
+`BaseImporter.beforeImport()` → `generateIdentifier()` (`importers/data/base.js:89-99`):
 
 ```javascript
-async cleanUp() {
-    if (this.fileToDelete === null) {
-        return;
-    }
-    try {
-        await fs.remove(this.fileToDelete);  // 删除 zip 解压的临时目录
-    } catch (err) {
-        // 清理失败只记录错误，不影响导入结果
-        logging.error(...);
-    }
-    this.fileToDelete = null;
-}
-```
+generateIdentifier() {
+    _.each(this.dataToImport, (obj) => {
+        const newId = ObjectId().toHexString();
 
-**清理始终执行** - 在 `finally` 块中调用，无论成功失败。
+        if (obj.id) {
+            // 保存 新ID → 原始ID 的映射
+            this.originalIdMap[newId] = obj.id;
+        }
 
-### 4.5 导入失败后的部分数据
-
-如果导入过程中发生错误：
-
-1. **已保存到存储的文件** - 保留在文件系统（孤立文件）
-2. **数据库中的结构数据** - 完全回滚（通过事务）
-3. **临时解压目录** - 被清理
-4. **用户邮件通知** - 发送失败邮件
-
----
-
-## 五、导入器依赖关系
-
-### 5.1 导入顺序
-
-`DataImporter` 中 importers 的初始化顺序 (`data-importer.js:33-47`) 决定了执行顺序：
-
-1. UsersImporter → 2. RolesImporter → 3. TagsImporter → 4. NewslettersImporter → 5. SettingsImporter → 6. ProductsImporter → 7. StripeProductsImporter → 8. StripePricesImporter → 9. PostsImporter
-
-### 5.2 依赖声明
-
-每个 importer 通过 options 声明依赖：
-
-**PostsImporter** (`posts-importer.js:15-26`):
-```javascript
-requiredFromFile: [
-    'posts', 'tags', 'posts_tags', 'posts_authors', 
-    'posts_meta', 'products', 'posts_products'
-],
-requiredImportedData: ['tags', 'products', 'newsletters'],
-requiredExistingData: ['tags', 'products', 'newsletters']
-```
-
-**依赖解析** (`data-importer.js:132-142`):
-```javascript
-if (importer.options.requiredImportedData.length) {
-    _.each(importer.options.requiredImportedData, (key) => {
-        importer.requiredImportedData[key] = importers[key].importedData;
+        obj.id = newId;  // 替换为新 ID
     });
 }
 ```
 
-### 5.3 默认用户依赖
-
-所有 importer 都默认依赖 users (`base.js:34-54`):
+**导入后的数据映射** (`base.js:309-317`):
 ```javascript
-if (!this.options.requiredImportedData) {
-    this.options.requiredImportedData = ['users'];
-} else {
-    this.options.requiredImportedData.push('users');
+mapImportedData(originalObject, importedObject) {
+    return {
+        id: importedObject.id,              // 新 ID
+        originalId: this.originalIdMap[importedObject.id],  // 原始 ID
+        slug: importedObject.get('slug'),
+        originalSlug: originalObject.slug,
+        email: importedObject.get('email')  // 用户特有
+    };
 }
 ```
+
+`importedData` 数组保存这些映射，供后续 importer 做关联匹配。
+
+### 3.5 用户引用重映射
+
+**在 `replaceIdentifiers()` 阶段**处理用户引用。
+
+`BaseImporter.replaceIdentifiers()` (`base.js:184-304`) 处理字段：
+- `author_id`
+- `published_by`
+
+**匹配策略（优先级从高到低）：**
+
+| 优先级 | 匹配方式 | 说明 |
+|--------|----------|------|
+| 1 | 空值检查 | 引用为空 → fallback 到 Owner |
+| 2 | 文件内匹配 | `requiredFromFile.users` 中按 ID 查找 |
+| 3 | 已导入匹配 | `requiredImportedData.users` 中按 **email** 查找（slug 可能变化） |
+| 4 | 数据库匹配 | `requiredExistingData.users` 中先按 slug、再按 ID 查找 |
+| 5 | 最终 fallback | 都找不到 → 使用 Owner 用户 ID |
+
+### 3.6 文章关系重映射
+
+`PostsImporter.replaceIdentifiers()` (`posts-importer.js:116-214`) 处理三类关联：
+
+**1. 标签关联 (tags):**
+```
+posts_tags[tag_id] → 原始 tag ID
+                      ↓
+         ① 匹配 requiredFromFile.tags (导入文件中的 tags)
+         ② 匹配 requiredImportedData.tags (已导入的 tags，按 originalId)
+         ③ 匹配 requiredExistingData.tags (数据库已有 tags，按 slug)
+         ④ 都找不到 → 移除此关联
+```
+
+**2. 作者关联 (authors):**
+```
+posts_authors[author_id] → 原始 user ID
+                           ↓
+         ① 匹配 requiredFromFile.users
+         ② 匹配 requiredImportedData.users (按 originalId)
+         ③ 匹配 requiredExistingData.users (按 slug)
+         ④ 都找不到 → 特殊处理：
+            - 如果所有作者都丢失，fallback 到 Owner
+            - 因为文章必须至少有一个作者
+```
+
+**3. 产品关联 (tiers):**
+```
+posts_products[product_id] → 原始 product ID
+                             ↓
+         ① 匹配 requiredFromFile.products
+         ② 匹配 requiredImportedData.products
+         ③ 匹配 requiredExistingData.products
+         ④ 都找不到 → 移除此关联
+```
+
+**4. 通讯关联 (newsletter_id):**
+```
+post.newsletter_id → 原始 newsletter ID
+                      ↓
+         ① 匹配 requiredImportedData.newsletters (按 originalId)
+         ② 匹配 requiredExistingData.newsletters (按 ID)
+         ③ 都找不到 → 删除 newsletter_id 字段
+```
+
+### 3.7 Stripe 循环引用修复
+
+**问题** (`data-importer.js:155-182`):
+```
+stripe_prices → stripe_products → products → stripe_prices
+     ↑_________________________________________|
+```
+
+products 表有 `monthly_price_id` 和 `yearly_price_id` 字段引用 stripe_prices，但 stripe_prices 导入在 products 之后。
+
+**修复策略：**
+1. 所有数据导入完成后
+2. 遍历已导入的 products
+3. 通过 `originalId` 查找已导入的 stripe_prices
+4. 更新 products 表的价格字段
+5. 此修复也在同一事务内
+
+### 3.8 用户角色特殊处理
+
+`UsersImporter.beforeImport()` (`importers/data/users-importer.js:31-88`):
+
+| 场景 | 处理方式 |
+|------|----------|
+| Owner 角色 | 不允许导入，自动转为 Administrator |
+| 员工数量限制 | 如果站点有 staff limit，所有用户设为 Contributor |
+| 角色匹配 | 通过角色 **名称** 匹配，而非 ID |
+| 导入用户状态 | 默认锁定，需通过找回密码流程重新激活 |
 
 ---
 
-## 六、版本兼容性检查
+## 四、回滚边界分析
 
-### 6.1 导入文件版本验证
+### 4.1 导入流程中的事务边界
 
-`DataImporter.doImport()` (`data-importer.js:99-120`):
+```
+时间线 ────────────────────────────────────────────────────────►
 
-```javascript
-// 必须有 meta 字段
-if (!importData.meta) {
-    return Promise.reject(new IncorrectUsageError(...));
-}
+Step 1: loadFile()
+├─ Zip 解压到临时目录                    ── 无事务，失败则抛错
+└─ Handlers 计算文件元数据               ── 无事务，失败则抛错
 
-// 必须有 version 字段
-if (!importData.meta.version) {
-    return Promise.reject(new IncorrectUsageError(...));
-}
+Step 2: preProcess()
+├─ 路径替换（修改内存中的 importData）   ── 无副作用
+└─ Revue 格式转换（修改内存数据）         ── 无副作用
 
-// 必须是有效的 semver 版本 (拒绝 Ghost v0.x 的非 semver 格式)
-if (!semver.valid(importData.meta.version)) {
-    return Promise.reject(new IncorrectUsageError({
-        message: 'Detected unsupported file structure.',
-        help: 'Please install Ghost 1.0, import the file and then update your blog...'
-    }));
-}
+Step 3: doImport()
+├─ ① imageImporter.doImport()
+│  └─ 保存图片到存储                      ── ❌ 无事务，不可回滚
+├─ ② mediaImporter.doImport()
+│  └─ 保存媒体到存储                      ── ❌ 无事务，不可回滚
+├─ ③ filesImporter.doImport()
+│  └─ 保存附件到存储                      ── ❌ 无事务，不可回滚
+├─ ④ RevueImporter.doImport()
+│  └─ 空操作                              ── 无副作用
+└─ ⑤ DataImporter.doImport()
+   └─ 数据库事务开始
+      ├─ users 导入                       ── ✅ 事务保护
+      ├─ roles 导入                       ── ✅ 事务保护
+      ├─ tags 导入                        ── ✅ 事务保护
+      ├─ newsletters 导入                 ── ✅ 事务保护
+      ├─ settings 导入                    ── ✅ 事务保护
+      ├─ products 导入                    ── ✅ 事务保护
+      ├─ stripe_products 导入             ── ✅ 事务保护
+      ├─ stripe_prices 导入               ── ✅ 事务保护
+      ├─ posts 导入                       ── ✅ 事务保护
+      ├─ custom_theme_settings 导入       ── ✅ 事务保护
+      ├─ revue_subscribers 导入           ── ✅ 事务保护
+      ├─ Stripe 循环引用修复              ── ✅ 事务保护
+      ├─ 检测 errors.length > 0 ?
+      │  ├─ Yes → throw errors            ── 触发事务回滚
+      │  └─ No → commit                   ── 事务提交
+      └─ 数据库事务结束
+
+Step 4-6: 收尾
+├─ generateReport()                       ── 无副作用
+├─ cleanUp()                              ── 删除临时解压目录
+└─ 发送邮件通知                           ── 无论成功失败
 ```
 
-### 6.2 支持的版本
+### 4.2 回滚边界总结表
 
-- **Ghost 1.x+** - 支持直接导入
-- **Ghost 0.x** - 必须先升级到 Ghost 1.0 再导入
+| 阶段 | 操作内容 | 事务保护 | 失败后状态 |
+|------|----------|----------|-----------|
+| loadFile | Zip 解压、Handlers 计算路径 | ❌ 无 | 临时目录在 cleanUp 中删除 |
+| preProcess | 路径替换、格式转换 | - | 仅内存操作，无持久化 |
+| imageImporter.doImport | 保存图片到存储 | ❌ 无 | **已保存的图片保留（孤立文件）** |
+| mediaImporter.doImport | 保存媒体到存储 | ❌ 无 | **已保存的媒体保留（孤立文件）** |
+| filesImporter.doImport | 保存附件到存储 | ❌ 无 | **已保存的附件保留（孤立文件）** |
+| DataImporter.doImport | 所有数据库操作 | ✅ 有 | **完全回滚** |
+
+### 4.3 错误分类：Errors vs Problems
+
+`BaseImporter.handleError()` (`base.js:111-174`) 区分两种错误：
+
+| 类型 | 触发回滚 | 示例 |
+|------|----------|------|
+| **Errors** | ✅ 是 | 数据验证失败、唯一约束冲突（`allowDuplicates=false`） |
+| **Problems** | ❌ 否 | 日期格式错误、用户引用找不到、重复条目被忽略 |
+
+**常见 Problems（自动处理，不回滚）：**
+- 日期格式无效 → 使用当前时间戳
+- 用户引用找不到 → fallback 到 Owner
+- 重复 slug → 忽略重复项
+- 关联的 tag/author 找不到 → 移除关联或 fallback
+- 文章必须有作者 → 所有作者丢失时 fallback 到 Owner
+
+### 4.4 导入失败后的残留数据
+
+**场景：DataImporter 事务回滚**
+
+| 数据类型 | 状态 | 说明 |
+|----------|------|------|
+| 已保存的图片/媒体/附件 | ⚠️ 保留 | 存储中存在但数据库无引用 |
+| 数据库结构数据 | ❌ 已回滚 | 事务保证原子性 |
+| 临时解压目录 | ✅ 已清理 | cleanUp() 在 finally 中执行 |
+| 导入标记标签 | ❌ 已回滚 | 自动创建的 `#Import YYYY-MM-DD HH:mm` 标签 |
+
+### 4.5 清理机制
+
+`cleanUp()` (`import-manager.js:441-457`):
+- 在 `finally` 块中执行，无论成功失败
+- 只删除 zip 解压的临时目录
+- **不清理** 已保存到存储的资源文件
+- 清理失败只记录日志，不影响导入结果
+
+---
+
+## 五、跨实例迁移完整流程（可复查）
+
+### 5.1 迁移准备
+
+**源实例操作：**
+1. Admin UI → Settings → Labs → Migration tools → "Content & settings"
+2. 下载得到 `.json` 文件（仅数据库快照）
+3. **手动** 从源实例存储复制以下目录：
+   - `content/images/`
+   - `content/media/`
+   - `content/files/`
+4. 将 `.json` 和上述目录打包为 `.zip`
+
+**Zip 结构要求（任一即可）：**
+```
+# 结构 A：根目录直接放置
+export.zip
+├── ghost.2024-01-01-12-00-00.json
+├── images/
+│   └── 2024/
+│       └── 01/
+│           └── photo.jpg
+├── media/
+└── files/
+
+# 结构 B：单层基础目录
+export.zip
+└── my-site/
+    ├── ghost.2024-01-01-12-00-00.json
+    ├── images/
+    ├── media/
+    └── files/
+```
+
+### 5.2 导入执行流程复查
+
+```
+用户上传 zip
+    ↓
+POST /db/
+    ↓
+ImportManager.importFromFile()
+    ├─ 1. loadFile()
+    │   ├─ 解压 zip 到临时目录
+    │   ├─ ImageHandler 扫描 images/ → 生成 [{originalPath, newPath, targetDir}, ...]
+    │   ├─ mediaHandler 扫描 media/ → 同上
+    │   ├─ filesHandler 扫描 files/ → 同上
+    │   └─ JSONHandler 解析 .json → {meta, data: {posts, users, tags, ...}}
+    │
+    ├─ 2. preProcess()
+    │   ├─ imageImporter: 将 posts/tags/users 中的图片路径替换为 newPath
+    │   ├─ mediaImporter: 将 posts 中的媒体路径替换为 newPath
+    │   └─ filesImporter: 将 posts 中的文件路径替换为 newPath
+    │
+    ├─ 3. doImport()
+    │   ├─ imageImporter.doImport()
+    │   │   └─ store.save() → 图片写入存储 ← ⚠️ 无事务
+    │   ├─ mediaImporter.doImport()
+    │   │   └─ store.save() → 媒体写入存储 ← ⚠️ 无事务
+    │   ├─ filesImporter.doImport()
+    │   │   └─ store.save() → 附件写入存储 ← ⚠️ 无事务
+    │   └─ DataImporter.doImport()
+    │       └─ 数据库事务开始
+    │           ├─ 版本检查 (meta.version 必须是有效 semver)
+    │           ├─ UsersImporter:
+    │           │   ├─ fetchExisting: 读取现有用户
+    │           │   ├─ beforeImport: 生成新 ID，Owner 角色转 Admin
+    │           │   ├─ replaceIdentifiers: 用户引用映射
+    │           │   └─ doImport: 写入 users 表
+    │           ├─ TagsImporter:
+    │           │   ├─ fetchExisting: 读取现有标签
+    │           │   ├─ beforeImport: 生成新 ID
+    │           │   └─ doImport: slug 冲突则跳过
+    │           ├─ ... (其他 importers)
+    │           ├─ PostsImporter:
+    │           │   ├─ fetchExisting: 读取现有 tags/products/newsletters
+    │           │   ├─ beforeImport: 生成新 ID，构建关联数组
+    │           │   ├─ replaceIdentifiers: tags/authors/tiers 重映射
+    │           │   └─ doImport: 写入 posts 及关联表
+    │           ├─ Stripe 循环引用修复
+    │           ├─ errors 检查
+    │           │   ├─ 有 errors → throw → 事务回滚 ← ✅ 结构数据回滚
+    │           │   └─ 无 errors → commit ← ✅ 结构数据提交
+    │           └─ 数据库事务结束
+    │
+    └─ 4-6. 收尾
+        ├─ cleanUp(): 删除临时目录
+        └─ 发送邮件（成功/失败）
+```
+
+### 5.3 迁移失败场景分析
+
+**场景 1：图片保存失败（imageImporter.doImport 抛错）**
+- 已保存的部分图片：保留
+- 未保存的图片：跳过
+- 数据库操作：未执行
+- 结果：部分图片孤立
+
+**场景 2：DataImporter 中 users 导入失败**
+- 已保存的图片/媒体/附件：保留（孤立）
+- 数据库操作：完全回滚
+- 结果：资源文件孤立，结构数据干净
+
+**场景 3：DataImporter 中 posts 导入产生 problems**
+- 部分文章的关联被移除或 fallback
+- problems 被记录但不触发回滚
+- 事务提交
+- 结果：导入完成但有警告（邮件通知包含 problems）
+
+**场景 4：DataImporter 中 posts 导入产生 errors**
+- 已保存的图片/媒体/附件：保留（孤立）
+- 数据库操作：完全回滚
+- 结果：资源文件孤立，结构数据干净
+
+---
+
+## 六、关键设计决策与风险点
+
+### 6.1 导出不包含资源文件
+
+**设计意图：**
+- 资源文件可能很大（GB 级别），JSON 导出保持轻量
+- 资源存储可能在外部（S3 等），导出逻辑复杂
+- 用户可手动管理资源文件迁移
+
+**风险：**
+- 用户容易遗漏资源文件，导致迁移后图片 404
+- 需要文档明确指导手动打包流程
+
+### 6.2 资源导入无事务保护
+
+**设计意图：**
+- 存储适配器（本地文件系统、S3 等）不支持事务
+- 跨系统事务（数据库 + 存储）实现复杂
+
+**风险：**
+- 导入失败后产生孤立文件
+- 需要额外的清理机制（当前没有）
+
+### 6.3 路径替换在 preProcess 阶段
+
+**设计意图：**
+- 路径替换是纯内存操作，不涉及持久化
+- 确保数据库中存储的是新路径
+
+**注意：**
+- 如果资源保存失败但数据库提交成功，文章中的路径指向不存在的文件
+
+### 6.4 Problems 不触发回滚
+
+**设计意图：**
+- 尽量让导入完成，而不是因小问题完全失败
+- 可恢复的问题（如用户引用找不到）自动修复
+
+**风险：**
+- 静默的数据丢失（如关联被移除）
+- 用户需检查邮件中的 problems 列表
 
 ---
 
 ## 七、代码位置索引
 
-| 功能 | 文件路径 |
-|------|----------|
-| 导出核心 | `ghost/core/core/server/data/exporter/exporter.js` |
+| 功能模块 | 文件路径 |
+|----------|----------|
+| 导出核心逻辑 | `ghost/core/core/server/data/exporter/exporter.js` |
 | 导出表定义 | `ghost/core/core/server/data/exporter/table-lists.js` |
+| 导出文件名 | `ghost/core/core/server/data/exporter/export-filename.js` |
 | 导入管理器 | `ghost/core/core/server/data/importer/import-manager.js` |
-| 数据导入器 | `ghost/core/core/server/data/importer/importers/data/data-importer.js` |
-| 基础导入器 | `ghost/core/core/server/data/importer/importers/data/base.js` |
-| 文章导入器 | `ghost/core/core/server/data/importer/importers/data/posts-importer.js` |
-| 用户导入器 | `ghost/core/core/server/data/importer/importers/data/users-importer.js` |
+| 数据导入器协调 | `ghost/core/core/server/data/importer/importers/data/data-importer.js` |
+| 基础导入器（ID生成、错误处理） | `ghost/core/core/server/data/importer/importers/data/base.js` |
+| 文章导入器（关联重映射） | `ghost/core/core/server/data/importer/importers/data/posts-importer.js` |
+| 用户导入器（角色处理） | `ghost/core/core/server/data/importer/importers/data/users-importer.js` |
 | 标签导入器 | `ghost/core/core/server/data/importer/importers/data/tags-importer.js` |
-| 内容文件处理器 | `ghost/core/core/server/data/importer/handlers/importer-content-file-handler.js` |
-| 图片处理器 | `ghost/core/core/server/data/importer/handlers/image.js` |
-| 内容文件导入器 | `ghost/core/core/server/data/importer/importers/content-file-importer.js` |
+| 内容文件导入器（资源保存） | `ghost/core/core/server/data/importer/importers/content-file-importer.js` |
+| JSON Handler | `ghost/core/core/server/data/importer/handlers/json.js` |
+| 图片 Handler | `ghost/core/core/server/data/importer/handlers/image.js` |
+| 内容文件 Handler | `ghost/core/core/server/data/importer/handlers/importer-content-file-handler.js` |
 | DB API 端点 | `ghost/core/core/server/api/endpoints/db.js` |
+| 本地备份 | `ghost/core/core/server/data/db/backup.js` |
+| Admin 前端导出按钮 | `apps/admin-x-settings/src/components/settings/advanced/migration-tools/migration-tools-export.tsx` |
+| Admin 前端导入模态框 | `apps/admin-x-settings/src/components/settings/advanced/migration-tools/universal-import-modal.tsx` |
+| 前端 API 封装 | `apps/admin-x-framework/src/api/db.ts` |
