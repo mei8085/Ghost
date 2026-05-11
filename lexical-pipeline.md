@@ -468,7 +468,229 @@ const emailCardTemplate = ({node, options, cardClasses}) => {
 - 点击跳转到文章 URL
 - Outlook 兼容性处理（VML 语法）
 
-### 5.3 外部媒体内联
+### 5.3 Embed 嵌入媒体链路
+
+#### 5.3.1 Embed 卡片数据结构
+
+**Lexical 节点类型**: `type: "embed"`
+
+**数据结构示例**:
+```json
+{
+  "type": "embed",
+  "version": 1,
+  "url": "https://www.youtube.com/watch?v=jfKfPfyJRdk",
+  "embedType": "video",
+  "html": "<iframe src=\"https://www.youtube.com/embed/jfKfPfyJRdk\"></iframe>",
+  "metadata": {
+    "title": "lofi hip hop radio",
+    "author_name": "Lofi Girl",
+    "provider_name": "YouTube",
+    "thumbnail_url": "https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg",
+    "thumbnail_width": 480,
+    "thumbnail_height": 360,
+    "type": "video"
+  },
+  "caption": ""
+}
+```
+
+**关键字段**:
+- `embedType`: 嵌入类型标识（`twitter`、`video` 等）
+- `html`: 原始 oEmbed HTML（通常是 `<iframe>`）
+- `metadata`: oEmbed 返回的元数据
+- `url`: 原始嵌入 URL
+
+#### 5.3.2 Embed 渲染器架构
+
+**渲染器入口**: `ghost/core/core/server/services/koenig/node-renderers/embed-renderer.js`
+
+**渲染决策流程**:
+
+```
+renderEmbedNode(node, options)
+    │
+    ├─→ node.embedType === 'twitter' ?
+    │       │
+    │       ├─→ YES ─→ twitterRenderer(node, document, options)
+    │       │                 │
+    │       │                 └─→ 专用 Twitter 渲染逻辑
+    │       │
+    │       └─→ NO ─→ renderTemplate(node, document, options)
+    │                         │
+    │                         └─→ 通用模板渲染
+    │
+    └─→ 检查 target: 'web' | 'email'
+            │
+            ├─→ Web: 直接输出原始 HTML
+            │
+            └─→ Email: 根据类型特殊处理
+```
+
+**核心代码** (`embed-renderer.js:5-16`):
+```javascript
+function renderEmbedNode(node, options = {}) {
+    addCreateDocumentOption(options);
+    const document = options.createDocument();
+    const embedType = node.embedType;
+
+    if (embedType === 'twitter') {
+        return twitterRenderer(node, document, options);
+    }
+
+    return renderTemplate(node, document, options);
+}
+```
+
+#### 5.3.3 Twitter 专用渲染器
+
+**位置**: `ghost/core/core/server/services/koenig/node-renderers/embed/types/twitter.js`
+
+**站点渲染（Web）**:
+- 直接输出 Twitter 提供的原始 `<blockquote>` HTML
+- 依赖 Twitter 前端 JS 进行渲染
+- 完整的交互功能（点赞、转发等）
+
+**邮件渲染（Email）**:
+- 解析 `metadata.tweet_data` 结构化数据
+- 使用 `<table>` 构建邮件兼容的 Twitter 卡片
+- 包含：用户头像、用户名、推文内容、图片、点赞/转发数
+- 所有元素都是可点击链接，跳转到 Twitter
+
+**邮件渲染特性** (`twitter.js:15-156`):
+
+```javascript
+if (tweetData && isEmail) {
+    // 1. 解析结构化数据
+    const tweetId = tweetData.id;
+    const authorUser = tweetData.users.find(u => u.id === tweetData.author_id);
+    
+    // 2. 格式化数字
+    const retweetCount = numberFormatter.format(tweetData.public_metrics.retweet_count);
+    const likeCount = numberFormatter.format(tweetData.public_metrics.like_count);
+    
+    // 3. 处理实体（@提及、#话题、URL）
+    const entities = mentions.concat(urls).concat(hashtags).sort(...);
+    
+    // 4. 生成邮件兼容的 HTML（纯 table，无 JS）
+    html = `
+        <table cellspacing="0" cellpadding="0" border="0" class="kg-twitter-card">
+            <!-- 用户信息行 -->
+            <tr>
+                <td><a href="..."><img src="${authorUser.profile_image_url}"></a></td>
+                <td><a href="...">${authorUser.name}<br>@${authorUser.username}</a></td>
+                <td><a href="..."><img src="twitter-logo.png"></a></td>
+            </tr>
+            <!-- 推文内容 -->
+            <tr><td colspan="3"><a href="...">${tweetContent}</a></td></tr>
+            <!-- 附件图片 -->
+            ${hasImageOrVideo ? `<tr><td colspan="3"><a href="..."><img src="${tweetImageUrl}"></a></td></tr>` : ''}
+            <!-- 时间戳 -->
+            <tr><td colspan="3"><a href="...">${tweetTime} &bull; ${tweetDate}</a></td></tr>
+            <!-- 互动数据 -->
+            <tr><td colspan="3"><a href="..."><span>${likeCount} likes</span> <span>${retweetCount} retweets</span></a></td></tr>
+        </table>
+    `;
+}
+```
+
+**回退机制**:
+- 如果没有 `tweet_data`（结构化数据缺失），回退到原始 HTML
+- 但在邮件中，原始 `<blockquote>` + Twitter JS 无法工作
+
+#### 5.3.4 Video Embed 处理
+
+**判定条件** (`embed-renderer.js:25`):
+```javascript
+const isVideoWithThumbnail = node.embedType === 'video' && metadata && metadata.thumbnail_url;
+```
+
+**站点渲染（Web）**:
+```javascript
+// 直接输出原始 iframe
+figure.innerHTML = node.html;
+// 结果: <iframe src="https://www.youtube.com/embed/..."></iframe>
+```
+
+**邮件渲染（Email）**:
+
+由于邮件客户端不支持 `<iframe>`，采用**缩略图预览 + 链接**策略：
+
+```javascript
+if (isEmail && isVideoWithThumbnail) {
+    const emailTemplateMaxWidth = 600;
+    const thumbnailAspectRatio = metadata.thumbnail_width / metadata.thumbnail_height;
+    
+    const html = `
+        <!-- 现代邮件客户端 -->
+        <!--[if !mso !vml]-->
+        <a class="kg-video-preview" href="${url}" aria-label="Play video">
+            <table background="${metadata.thumbnail_url}">
+                <tr>
+                    <td width="25%">
+                        <img src="spacer.png" style="opacity: 0;">
+                    </td>
+                    <td width="50%" align="center" valign="middle">
+                        <div class="kg-video-play-button"></div>
+                    </td>
+                    <td width="25%">&nbsp;</td>
+                </tr>
+            </table>
+        </a>
+        <!--[endif]-->
+
+        <!-- Outlook VML 语法 -->
+        <!--[if vml]>
+        <v:group coordsize="${emailTemplateMaxWidth},${spacerHeight}" href="${url}">
+            <v:rect><v:fill src="${metadata.thumbnail_url}" type="frame"/></v:rect>
+            <v:oval style="left:261;top:186;width:78;height:78"><v:fill color="black" opacity="30%"/></v:oval>
+            <v:shape coordsize="24,32" path="m,l,32,24,16,xe" fillcolor="white"/>
+        </v:group>
+        <![endif]-->
+    `;
+}
+```
+
+**邮件视频渲染策略**:
+1. **现代客户端**: 使用透明 spacer 图片维持宽高比，背景设为缩略图，中央显示播放按钮
+2. **Outlook**: 使用 VML（Vector Markup Language）绘制播放按钮和背景
+3. **点击行为**: 跳转到原始视频 URL（`node.url`）
+
+**回退机制**:
+- 如果没有 `thumbnail_url`（缩略图缺失），回退到原始 HTML
+- 但在邮件中，原始 `<iframe>` 可能不被支持
+
+#### 5.3.5 通用 HTML 回退
+
+**适用场景**:
+- 非 Twitter、非视频的 embed 类型（如 Slideshare、Soundcloud 等）
+- 视频 embed 但缺少缩略图
+- Twitter embed 但缺少结构化数据
+
+**渲染逻辑**:
+```javascript
+// 通用模板 - 直接输出原始 HTML
+figure.innerHTML = node.html;
+```
+
+**Web 场景**: 正常工作，原始 `<iframe>` 被渲染
+
+**Email 场景**: 风险较高
+- 某些邮件客户端可能不支持 `<iframe>`
+- 可能显示为空白或安全警告
+- 建议添加 `caption` 作为降级体验
+
+#### 5.3.6 Embed 渲染分支总结
+
+| Embed 类型 | Web 渲染 | Email 渲染 | 依赖条件 |
+|-----------|---------|-----------|---------|
+| **Twitter** (有 tweet_data) | 原始 `<blockquote>` + Twitter JS | 自定义 `<table>` 卡片 | `embedType === 'twitter'` + `metadata.tweet_data` |
+| **Twitter** (无 tweet_data) | 原始 `<blockquote>` | 原始 HTML（可能不工作） | `embedType === 'twitter'` + 无结构化数据 |
+| **Video** (有 thumbnail) | 原始 `<iframe>` | 缩略图预览 + 链接 | `embedType === 'video'` + `metadata.thumbnail_url` |
+| **Video** (无 thumbnail) | 原始 `<iframe>` | 原始 HTML（可能不工作） | `embedType === 'video'` + 无缩略图 |
+| **其他** (Slideshare 等) | 原始 `<iframe>` | 原始 HTML（风险较高） | `embedType !== 'twitter' && !== 'video'` |
+
+### 5.4 外部媒体内联
 
 **服务**: `ghost/core/core/server/services/media-inliner/external-media-inliner.js`
 
