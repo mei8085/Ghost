@@ -690,6 +690,317 @@ figure.innerHTML = node.html;
 | **Video** (无 thumbnail) | 原始 `<iframe>` | 原始 HTML（可能不工作） | `embedType === 'video'` + 无缩略图 |
 | **其他** (Slideshare 等) | 原始 `<iframe>` | 原始 HTML（风险较高） | `embedType !== 'twitter' && !== 'video'` |
 
+#### 5.3.7 Embed 元数据闭环
+
+本节详细追踪 `metadata.tweet_data` 和 `metadata.thumbnail_url` 从编辑器插入到服务端渲染的完整链路。
+
+##### 一、编辑器端：Embed 插入流程
+
+**触发点**：用户在编辑器中粘贴 Twitter/YouTube 链接，或使用 Embed 卡片工具插入。
+
+**数据流**：
+
+```
+编辑器（React + Lexical）
+    ↓
+粘贴 URL / 选择 Embed 卡片
+    ↓
+Ember 桥接组件调用 fetchEmbed 服务
+    ↓
+调用 Ghost Admin API: GET /ghost/api/admin/oembed?url=...
+```
+
+**关键配置传递** (`ghost/admin/app/components/koenig-lexical-editor.js`):
+编辑器通过 `fetchEmbed` 回调向 React/Lexical 传递 oEmbed 获取能力。
+
+##### 二、服务端：oEmbed API 端点
+
+**路由注册** (`ghost/core/core/server/web/api/endpoints/admin/routes.js:359-360`):
+```javascript
+// ## Oembed (fetch response from oembed provider)
+router.get('/oembed', mw.authAdminApi, http(api.oembed.read));
+```
+
+**API 控制器** (`ghost/core/core/server/api/endpoints/oembed.js:1-23`):
+```javascript
+const oembed = require('../../services/oembed');
+
+query({data}) {
+    let {url, type} = data;
+    return oembed.fetchOembedDataFromUrl(url, type);
+}
+```
+
+##### 三、服务端：oEmbed 服务核心
+
+**服务初始化** (`ghost/core/core/server/services/oembed/service.js:1-24`):
+```javascript
+const OEmbedService = require('./oembed-service');
+const oembed = new OEmbedService({config, externalRequest, storage});
+
+// 注册自定义 Provider
+const Twitter = require('./twitter-oembed-provider');
+const twitter = new Twitter({
+    config: {
+        bearerToken: config.get('twitter').privateReadOnlyToken  // Twitter API Bearer Token
+    }
+});
+oembed.registerProvider(twitter);
+```
+
+**核心请求处理** (`ghost/core/core/server/services/oembed/oembed-service.js:473-582`):
+
+```javascript
+async fetchOembedDataFromUrl(url, type, options = {}) {
+    const urlObject = new URL(url);
+
+    // 1. 先检查自定义 Provider
+    for (const provider of this.customProviders) {
+        if (await provider.canSupportRequest(urlObject)) {
+            const result = await provider.getOEmbedData(urlObject, this.externalRequest);
+            if (result !== null) {
+                return result;
+            }
+        }
+    }
+
+    // 2. 检查已知 oEmbed Provider 列表（@extractus/oembed-extractor）
+    if (type !== 'bookmark' && type !== 'mention') {
+        const {url: providerUrl, provider} = findUrlWithProvider(url);
+        if (provider) {
+            return this.knownProvider(providerUrl);  // 调用 @extractus/oembed-extractor
+        }
+    }
+
+    // 3. 回退：抓取页面 HTML，解析 oembed 链接
+    const {url: pageUrl, body, contentType} = await this.fetchPageHtml(url, options);
+    let data = await this.fetchOembedData(url, body);
+
+    // 4. 最终回退：Bookmark 卡片
+    if (!data && !type) {
+        data = await this.fetchBookmarkData(url, body, type);
+    }
+
+    return data;
+}
+```
+
+##### 四、Twitter 专用 Provider
+
+**位置**: `ghost/core/core/server/services/oembed/twitter-oembed-provider.js:13-89`
+
+**支持检测** (第 25-27 行):
+```javascript
+async canSupportRequest(url) {
+    return (url.host === 'twitter.com' || url.host === 'x.com') 
+        && TWITTER_PATH_REGEX.test(url.pathname);
+}
+```
+
+**数据获取** (第 35-88 行):
+
+```javascript
+async getOEmbedData(url, externalRequest) {
+    // 1. 标准 oEmbed 数据（通过 @extractus/oembed-extractor）
+    const {extract} = require('@extractus/oembed-extractor');
+    const oembedData = await extract(url.href);
+
+    // 2. Twitter API v2 增强数据（需要 Bearer Token）
+    if (this.dependencies.config.bearerToken) {
+        const query = {
+            expansions: ['attachments.poll_ids', 'attachments.media_keys', 'author_id', ...],
+            'media.fields': ['duration_ms', 'height', 'preview_image_url', 'url', ...],
+            'tweet.fields': ['attachments', 'author_id', 'public_metrics', 'text', ...],
+            'user.fields': ['created_at', 'profile_image_url', 'verified', ...]
+        };
+
+        const queryString = Object.keys(query).map((key) => {
+            return `${key}=${query[key].join(',')}`;
+        }).join('&');
+
+        try {
+            const body = await externalRequest(
+                `https://api.twitter.com/2/tweets/${tweetId}?${queryString}`, {
+                    headers: {
+                        Authorization: `Bearer ${this.dependencies.config.bearerToken}`
+                    }
+                }).json();
+
+            // 注入增强数据到 oembedData
+            oembedData.tweet_data = body.data;
+            oembedData.tweet_data.includes = body.includes;
+        } catch (err) {
+            logging.error(err);
+            // API 调用失败，继续返回标准 oEmbed 数据
+        }
+    }
+
+    oembedData.type = 'twitter';
+    return oembedData;
+}
+```
+
+**`tweet_data` 的来源与结构**：
+- **来源**: Twitter API v2 `/2/tweets/{id}` 端点
+- **包含内容**:
+  - `tweet_data.text`: 推文文本
+  - `tweet_data.public_metrics`: 互动数据（`retweet_count`, `like_count`）
+  - `tweet_data.author_id`: 作者 ID
+  - `tweet_data.attachments`: 附件（`media_keys`, `poll_ids`）
+  - `tweet_data.entities`: 实体（`mentions`, `urls`, `hashtags`）
+  - `tweet_data.includes`: 关联数据（用户信息、媒体信息）
+
+**`tweet_data` 可能缺失的场景**：
+1. 未配置 `twitter.privateReadOnlyToken`（Ghost 配置）
+2. Twitter API 请求失败（网络错误、认证失败、速率限制）
+3. 推文已删除或私有化
+4. 配置的 Token 权限不足
+
+##### 五、Video Embed 元数据来源
+
+**位置**: `ghost/core/core/server/services/oembed/oembed-service.js:115-133`
+
+```javascript
+async knownProvider(url) {
+    const {extract} = require('@extractus/oembed-extractor');
+    return await extract(url);
+}
+```
+
+**数据来源**：
+- **YouTube/Vimeo** 等视频平台提供的标准 oEmbed 响应
+- 包含字段：
+  - `thumbnail_url`: 视频缩略图 URL
+  - `thumbnail_width`, `thumbnail_height`: 缩略图尺寸
+  - `title`, `author_name`, `provider_name`: 视频元信息
+  - `html`: `<iframe>` 嵌入代码
+
+**`thumbnail_url` 可能缺失的场景**：
+1. oEmbed 响应不包含 `thumbnail_url` 字段
+2. 部分视频平台的 oEmbed 实现不完整
+3. 视频已被删除或设置为私有
+4. 抓取页面时未能正确解析 oEmbed 链接
+
+##### 六、元数据持久化路径
+
+**API 序列化器** (`ghost/core/core/server/api/endpoints/utils/serializers/input/posts.js:12`):
+```javascript
+const lexical = require('../../../../../lib/lexical');
+```
+
+API 序列化器**不修改** lexical 字段中的 embed metadata，原样透传。
+
+**Post 模型存储** (`ghost/core/core/server/models/post.js:178-239`):
+
+```javascript
+formatOnWrite(attrs) {
+    const urlTransformMap = {
+        lexical: {
+            method: 'lexicalToTransformReady',
+            options: {
+                nodes: lexicalLib.nodes,
+                transformMap: lexicalLib.urlTransformMap
+            }
+        }
+    };
+    // URL 转换：absolute → __GHOST_URL__
+    // metadata 中的 URL 也会被转换
+}
+```
+
+**数据库存储**：
+- Lexical 字段中完整存储：
+  ```json
+  {
+    "type": "embed",
+    "embedType": "twitter",
+    "html": "<blockquote>...</blockquote>",
+    "metadata": {
+      "tweet_data": {...},       // Twitter API 增强数据
+      "thumbnail_url": "https://...",  // 视频缩略图
+      "type": "video",
+      "provider_name": "YouTube"
+    }
+  }
+  ```
+
+##### 七、渲染时的条件判断与回退
+
+**Twitter 渲染器** (`ghost/core/core/server/services/koenig/node-renderers/embed/types/twitter.js:12-156`):
+
+```javascript
+function render(node, document, options) {
+    const metadata = node.metadata;
+    const tweetData = metadata && metadata.tweet_data;  // 关键判断
+    const isEmail = options.target === 'email';
+
+    // 只有同时满足两个条件才使用专用渲染
+    if (tweetData && isEmail) {
+        // 专用邮件渲染：使用 tweet_data 构建 <table> 卡片
+        html = `
+            <table cellspacing="0" cellpadding="0" border="0" class="kg-twitter-card">
+                <!-- 用户头像、推文内容、图片、互动数据 -->
+            </table>
+        `;
+    } else {
+        // 回退：原始 HTML
+        // Web: 正常工作（<blockquote> + Twitter JS）
+        // Email: 可能不工作（Twitter JS 不执行，<blockquote> 显示为纯文本）
+        html = node.html;
+    }
+}
+```
+
+**Video Embed 渲染器** (`ghost/core/core/server/services/koenig/node-renderers/embed-renderer.js:22-61`):
+
+```javascript
+function renderTemplate(node, document, options) {
+    const isEmail = options.target === 'email';
+    const metadata = node.metadata;
+    
+    // 关键判断：embedType === 'video' AND metadata.thumbnail_url 存在
+    const isVideoWithThumbnail = node.embedType === 'video' 
+        && metadata 
+        && metadata.thumbnail_url;
+
+    if (isEmail && isVideoWithThumbnail) {
+        // 专用邮件渲染：缩略图预览 + 链接（支持现代客户端和 Outlook VML）
+        const html = `
+            <!-- 现代客户端 -->
+            <a class="kg-video-preview" href="${url}">
+                <table background="${metadata.thumbnail_url}">...</table>
+            </a>
+            <!-- Outlook VML -->
+            <v:group coordsize="...">...</v:group>
+        `;
+        figure.innerHTML = html.trim();
+    } else {
+        // 回退：原始 HTML
+        // Web: 正常工作（<iframe>）
+        // Email: 可能不工作（<iframe> 不被支持）
+        figure.innerHTML = node.html;
+    }
+}
+```
+
+##### 八、字段缺失时的回退影响总结
+
+| 字段 | 来源 | 缺失原因 | 邮件渲染结果 | Web 渲染结果 |
+|-----|------|---------|-------------|-------------|
+| `metadata.tweet_data` | Twitter API v2 | Token 未配置/请求失败 | 回退到原始 `<blockquote>`，Twitter JS 不执行，显示可能异常 | 正常工作（前端 JS 可渲染） |
+| `metadata.thumbnail_url` | oEmbed 响应 | oEmbed 不完整/视频已删除 | 回退到原始 `<iframe>`，邮件客户端不支持 iframe，可能显示空白 | 正常工作（<iframe> 可渲染） |
+
+**为什么回退会导致问题？**
+
+邮件环境的限制：
+1. **JavaScript 不执行**：Twitter 的 `<blockquote>` + `<script>` 模式依赖前端 JS 渲染卡片，邮件客户端通常禁用 JS
+2. **iframe 不支持/受限**：YouTube/Vimeo 的 `<iframe>` 在邮件中可能被阻止、显示空白或触发安全警告
+3. **Outlook 特殊处理**：Outlook 使用 Word 渲染引擎，对现代 HTML/CSS 支持有限
+
+**专用渲染器解决的问题**：
+1. **Twitter 专用渲染**：使用 `tweet_data` 构建纯 HTML `<table>`，无需 JS 依赖
+2. **Video 专用渲染**：使用 `thumbnail_url` 构建图片预览 + 链接，避开 iframe 限制
+
 ### 5.4 外部媒体内联
 
 **服务**: `ghost/core/core/server/services/media-inliner/external-media-inliner.js`
@@ -853,3 +1164,14 @@ figure.innerHTML = node.html;
 5. **邮件兼容性**: 针对邮件客户端（特别是 Outlook）做了专门的兼容性处理
 
 6. **插件化渲染器**: 自定义节点渲染器采用注册机制，易于扩展新的卡片类型
+
+7. **Embed 分层渲染架构**:
+   - 第一层：按 `embedType` 路由（Twitter 专用 vs 通用）
+   - 第二层：按 `target` 分支（Web vs Email）
+   - 第三层：按元数据可用性降级（有 thumbnail/tweet_data vs 无）
+
+8. **Twitter 邮件专用渲染**: 使用 Twitter API 结构化数据（`tweet_data`）重新构建邮件兼容卡片，避免依赖前端 JS
+
+9. **视频邮件降级策略**: `<iframe>` → 缩略图预览 + 链接，同时支持现代客户端和 Outlook（VML）
+
+10. **渐进式回退机制**: 每种 embed 类型都有多层回退：专用渲染 → 结构化数据渲染 → 原始 HTML，确保最差情况下也能显示内容
