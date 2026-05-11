@@ -135,9 +135,9 @@
 
 ## 二、Tier 与 Offer 的双向映射
 
-### 2.1 Tier (Product) 到 Stripe 的映射
+### 2.1 Tier (Product) 与 Stripe 的双向映射
 
-#### 2.1.1 映射链
+#### 2.1.1 Tier → Stripe 正向映射链
 
 ```
 Tier (Domain Model)
@@ -152,6 +152,69 @@ Stripe Price (Stripe API)
     ↓
 StripePrice (本地映射表)
 ```
+
+#### 2.1.2 Stripe → Tier 回流定位链路
+
+当 Stripe Webhook 触发（如订阅创建、更新）时，系统需要从 Stripe Subscription 反推到本地 Tier/Product：
+
+```
+Stripe Subscription (from Webhook)
+    ↓
+items.data[0].price.product (获取 stripe_product_id)
+    ↓
+stripe_products 表: WHERE stripe_product_id = ?
+    ↓
+stripeProduct.related('product').fetch()
+    ↓
+本地 Product/Tier
+```
+
+**核心定位逻辑** (`product-repository.js:90-100`):
+
+```javascript
+async get(data, options) {
+    // ...
+    if ('stripe_product_id' in data) {
+        // 1. 先查映射表
+        const stripeProduct = await this._StripeProduct.findOne({
+            stripe_product_id: data.stripe_product_id
+        }, options);
+
+        if (!stripeProduct) {
+            return null;
+        }
+
+        // 2. 通过 Bookshelf 关系获取本地 Product
+        return await stripeProduct.related('product').fetch(options);
+    }
+    // ...
+}
+```
+
+**调用链路** (`member-repository.js:1084-1090`):
+
+```javascript
+const subscriptionPriceData = _.get(stripeSubscriptionData, 'items.data[0].price');
+
+// 从 Stripe Subscription 获取 stripe_product_id
+ghostProduct = await this._productRepository.get(
+    {stripe_product_id: subscriptionPriceData.product}, 
+    options
+);
+
+// 兜底：找不到映射时使用默认付费产品
+if (!ghostProduct) {
+    ghostProduct = await this._productRepository.getDefaultProduct(options);
+}
+```
+
+**回流后的同步操作** (`member-repository.js:1093-1110`):
+
+找到或使用默认 Product 后，调用 `productRepository.update({stripe_prices: [...]})` 确保 Stripe Price 记录存在于本地 `stripe_prices` 表中。
+
+参考:
+- `ghost/core/core/server/services/members/members-api/repositories/product-repository.js:81-144`
+- `ghost/core/core/server/services/members/members-api/repositories/member-repository.js:1084-1118`
 
 #### 2.1.2 同步触发机制
 
