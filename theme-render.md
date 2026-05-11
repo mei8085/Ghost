@@ -289,7 +289,182 @@ handle404: function handle404(err, req, res, next) {
 
 **设计意图**：防止攻击者通过尝试不同路径并观察是 404 还是重定向来推断站点的内容结构。
 
-### 0.7 与 Members 权限系统的职责边界
+### 0.7 Frontend Caching 策略
+
+**文件**：`ghost/core/core/frontend/web/middleware/frontend-caching.js`
+
+#### 0.7.1 请求管线中的位置
+
+```javascript
+// site.js 第 122-130 行
+// 在 checkIsPrivate/filterPrivateRoutes 之后，siteRoutes 之前
+siteApp.use(async function frontendCaching(req, res, next) {
+    try {
+        const middleware = await mw.frontendCaching.getMiddleware();
+        return middleware(req, res, next);
+    } catch {
+        return next();
+    }
+});
+```
+
+**关键点**：`checkIsPrivate` 先设置 `res.isPrivateBlog`，然后 `frontendCaching` 基于此标志决定缓存策略。
+
+#### 0.7.2 缓存策略决策
+
+**核心判断**（第 53-57 行）：
+```javascript
+const shouldCacheMembersContent = config.get('cacheMembersContent:enabled');
+
+if (res.isPrivateBlog || (req.member && !shouldCacheMembersContent)) {
+    return shared.middleware.cacheControl('private')(req, res, next);
+}
+```
+
+**完整决策树**：
+
+```
+HTTP 请求
+   │
+   ├─► checkIsPrivate 设置 res.isPrivateBlog
+   │
+   └─► frontend-caching 决策
+         │
+         ├─► 预览请求? ──────► Cache-Control: noCache
+         │
+         ├─► res.isPrivateBlog?
+         │    ├─► YES ─────────► Cache-Control: private (完全不缓存)
+         │    │
+         │    └─► NO ──────────► 继续判断
+         │
+         ├─► req.member 存在?
+         │    ├─► NO ─────────► Cache-Control: public, max-age=...
+         │    │
+         │    └─► YES ─────────► 继续判断
+         │
+         └─► shouldCacheMembersContent?
+              ├─► NO ──────────► Cache-Control: private
+              │
+              └─► YES ─────────► 继续判断
+                   │
+                   ├─► 多活跃订阅? ──► Cache-Control: private
+                   │
+                   └─► 单订阅/免费 ──► Cache-Control: public, X-Member-Cache-Tier: <tierId>
+```
+
+#### 0.7.3 cacheControl 配置
+
+**文件**：`ghost/core/core/server/web/shared/middleware/cache-control.js` 第 25-29 行
+
+```javascript
+const profiles = {
+    public: 'public, max-age=<value>, stale-while-revalidate=<value>',
+    noCache: 'no-cache, max-age=0, no-store, must-revalidate, max-stale=0, post-check=0, pre-check=0',
+    private: 'no-cache, private, no-store, must-revalidate, max-stale=0, post-check=0, pre-check=0'
+};
+```
+
+**Private Site 模式下的实际响应头**：
+```
+Cache-Control: no-cache, private, no-store, must-revalidate, max-stale=0, post-check=0, pre-check=0
+```
+
+**这意味着**：
+- `private`：仅可被用户的浏览器缓存，不可被共享缓存（CDN）存储
+- `no-store`：**完全禁止**在任何缓存中存储响应
+- `no-cache`：即使缓存了，每次使用前必须重新验证
+- `must-revalidate`：缓存过期后必须回源验证
+
+**设计目的**：
+1. 防止私有站点的内容被 CDN/代理缓存泄露
+2. 确保每次请求都经过 Private Site 认证检查
+3. 与 `ghost-private` 会话机制配合，实现即时访问控制
+
+### 0.8 密码变更后会话整体失效机制
+
+**文件**：`ghost/core/core/frontend/apps/private-blogging/lib/middleware.js` 第 27-37 行
+
+#### 0.8.1 验证流程
+
+```javascript
+function verifySessionHash(salt, hash) {
+    const accessCode = settingsCache.get('password');  // 每次验证重新读取密码
+
+    // 第 30-32 行：密码为空 → 直接返回 false
+    if (!salt || !hash || !hasAccessCode(accessCode)) {
+        return false;
+    }
+
+    // 第 34-36 行：用当前密码重算哈希，与 session 中的 hash 比较
+    let hasher = crypto.createHash('sha256');
+    hasher.update(accessCode + salt, 'utf8');
+    return hasher.digest('hex') === hash;
+}
+```
+
+#### 0.8.2 失效原理
+
+**登录时写入的 session**：
+```
+session = {
+    token: SHA256(oldPassword + salt),  // 旧密码计算的哈希
+    salt: "1715412345678"               // 登录时的时间戳
+}
+```
+
+**密码变更后的验证**：
+```
+访问时 verifySessionHash(session.salt, session.token):
+
+1. 读取 settingsCache.get('password') → 得到 newPassword（新密码）
+2. 计算 SHA256(newPassword + session.salt)
+3. 与 session.token（SHA256(oldPassword + salt)）比较
+4. 不相等 → return false → 认证失败 → 重定向到 /private/
+```
+
+#### 0.8.3 三种失效场景
+
+| 场景 | 验证结果 | 用户体验 |
+|------|----------|----------|
+| **管理员变更密码** | `SHA256(新密码+salt)` ≠ `session.token` | 所有已登录用户被踢下线，需重新输入新密码 |
+| **管理员清除密码** (`password: ''`) | `hasAccessCode('')` → `false` | 所有已登录用户被踢下线 |
+| **用户自行登出** | cookie 被清除 | 下次访问需重新登录 |
+
+#### 0.8.4 测试验证
+
+**文件**：`test/unit/frontend/apps/private-blogging/middleware.test.js` 第 415-428 行
+
+```javascript
+it('authenticatePrivateSession should redirect when stored access code is empty', function () {
+    const salt = Date.now().toString();
+    settingsStub.withArgs('password').returns('');  // 密码被清除
+    req.url = '/welcome';
+    req.session = {
+        token: hash('', salt),
+        salt
+    };
+
+    privateBlogging.authenticatePrivateSession(req, res, next);
+    sinon.assert.notCalled(next);           // 不调用 next()
+    sinon.assert.called(res.redirect);      // 触发重定向
+    sinon.assert.calledWith(res.redirect, '/private/?r=%2Fwelcome');
+});
+```
+
+#### 0.8.5 设计优势
+
+| 特性 | 说明 |
+|------|------|
+| **无状态失效** | 不需要在服务器端维护 session 黑名单 |
+| **即时生效** | 密码变更立即影响所有现有会话，无需等待 cookie 过期 |
+| **零额外存储** | 不需要数据库记录 active sessions |
+| **自动处理** | 与 `settingsCache` 集成，密码更新后自动生效 |
+
+**对比 Members 系统**：
+- `ghost-private`：通过**哈希比对**实现无状态失效
+- `ghost-members-ssr`：通过 **transient_id 数据库查询**实现（可在数据库层面撤销）
+
+### 0.9 与 Members 权限系统的职责边界
 
 | 维度 | Private Site | Members Visibility / Access |
 |------|-------------|----------------------------|
@@ -1267,7 +1442,9 @@ module.exports = function checkVersionMatch(req, res, next) {
 
 | 文件路径 | 功能说明 |
 |----------|----------|
-| `core/server/services/members/content-gating.js` | 内容权限裁剪核心逻辑 |
+| `core/frontend/apps/private-blogging/lib/middleware.js` | Private Site 全站访问控制核心逻辑 |
+| `core/frontend/apps/private-blogging/index.js` | Private Site 中间件挂载与路由注册 |
+| `core/server/services/members/content-gating.js` | Members 内容权限裁剪核心逻辑 |
 | `core/server/api/endpoints/utils/serializers/output/utils/post-gating.js` | API 输出时的内容裁剪 |
 | `core/server/api/endpoints/utils/serializers/output/mappers/posts.js` | 帖子输出序列化（调用 gating） |
 | `core/frontend/services/data/fetch-data.js` | 前端数据获取（传递 member 上下文） |
