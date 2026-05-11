@@ -1001,6 +1001,351 @@ function renderTemplate(node, document, options) {
 1. **Twitter 专用渲染**：使用 `tweet_data` 构建纯 HTML `<table>`，无需 JS 依赖
 2. **Video 专用渲染**：使用 `thumbnail_url` 构建图片预览 + 链接，避开 iframe 限制
 
+#### 5.3.8 oEmbed 响应到 Lexical 节点的字段映射
+
+本节详细追踪 oEmbed API 响应如何映射到 Lexical embed 节点的各个字段。
+
+##### 一、字段映射位置说明
+
+**核心发现**：oEmbed 响应到 Lexical embed 节点的字段映射逻辑位于外部包 `@tryghost/koenig-lexical` 中，而非 Ghost 主仓库。
+
+**数据流转路径**：
+
+```
+服务端 oEmbed API (GET /oembed)
+    ↓ 返回 oEmbed JSON 响应
+Ember 桥接组件 (fetchEmbed)
+    ↓ 原样返回给 React/Lexical
+@tryghost/koenig-lexical (外部包)
+    ↓ 字段映射（此处执行）
+Lexical embed 节点 (存储在 lexical JSON)
+```
+
+**证据**：
+1. Ember 侧的 `fetchEmbed` 只是简单转发，不做处理 (`ghost/admin/app/components/koenig-lexical-editor.js:250-256`)
+2. 服务端 oEmbed 服务返回完整 oEmbed 响应，包含所有字段
+3. 渲染器测试直接使用 `metadata`、`embedType`、`html` 等字段，证明这些字段已存在于 Lexical 节点中
+
+##### 二、服务端 oEmbed 响应结构
+
+**位置**: `ghost/core/core/server/services/oembed/oembed-service.js`
+
+**已知 Provider 响应**（YouTube 示例，来自测试 `oembed-service.test.js:28-44`）：
+
+```javascript
+// YouTube oEmbed API 响应
+{
+    title: 'Test Title',
+    author_name: 'Test Author',
+    author_url: 'https://www.youtube.com/user/testauthor',
+    html: '<iframe src="https://www.youtube.com/embed/1234"></iframe>',
+    thumbnail_url: 'https://i.ytimg.com/vi/1234/hqdefault.jpg',
+    thumbnail_width: 480,
+    thumbnail_height: 360,
+    provider_name: 'YouTube',
+    provider_url: 'https://www.youtube.com/',
+    type: 'video',
+    version: '1.0',
+    width: 480,
+    height: 270
+}
+```
+
+**Twitter 增强响应**（自定义 Provider，来自 `twitter-oembed-provider.js:35-88`）：
+
+```javascript
+{
+    // 标准 oEmbed 字段（来自 @extractus/oembed-extractor）
+    type: 'twitter',  // 被覆盖为 'twitter'
+    html: '<blockquote class="twitter-tweet">...</blockquote><script async src="https://platform.twitter.com/widgets.js"></script>',
+    title: 'Twitter 标题',
+    author_name: '用户名',
+    author_url: 'https://twitter.com/username',
+    provider_name: 'Twitter',
+    
+    // 增强字段（来自 Twitter API v2）
+    tweet_data: {
+        id: '1630581157568839683',
+        text: '推文正文...',
+        author_id: '123456',
+        conversation_id: '1630581157568839683',
+        public_metrics: {
+            retweet_count: 6,
+            reply_count: 1,
+            like_count: 27
+        },
+        attachments: {
+            media_keys: ['3_1630581157568839680']
+        },
+        entities: {
+            mentions: [...],
+            urls: [...],
+            hashtags: [...]
+        },
+        includes: {
+            users: [{
+                id: '123456',
+                name: '用户名',
+                username: 'username',
+                profile_image_url: 'https://pbs.twimg.com/...',
+                verified: true
+            }],
+            media: [{
+                media_key: '3_1630581157568839680',
+                type: 'photo',
+                url: 'https://pbs.twimg.com/...',
+                preview_image_url: 'https://pbs.twimg.com/...'
+            }]
+        }
+    }
+}
+```
+
+##### 三、字段映射表
+
+基于测试数据和渲染器使用方式，推断字段映射如下：
+
+| oEmbed 响应字段 | Lexical embed 节点字段 | 说明 |
+|----------------|----------------------|------|
+| `html` | `node.html` | 原始嵌入 HTML（iframe 或 blockquote） |
+| `type` | `node.embedType` | 嵌入类型（`video`、`twitter`、`rich` 等） |
+| `type` + 其他字段 | `node.metadata` | oEmbed 响应中除 `html` 外的所有字段打包到 metadata |
+| `thumbnail_url` | `node.metadata.thumbnail_url` | 视频缩略图 URL |
+| `thumbnail_width` | `node.metadata.thumbnail_width` | 缩略图宽度 |
+| `thumbnail_height` | `node.metadata.thumbnail_height` | 缩略图高度 |
+| `title` | `node.metadata.title` | 嵌入内容标题 |
+| `author_name` | `node.metadata.author_name` | 作者/频道名称 |
+| `author_url` | `node.metadata.author_url` | 作者/频道 URL |
+| `provider_name` | `node.metadata.provider_name` | 平台名称（YouTube、Twitter） |
+| `provider_url` | `node.metadata.provider_url` | 平台 URL |
+| `width` | `node.metadata.width` | 嵌入宽度 |
+| `height` | `node.metadata.height` | 嵌入高度 |
+| `tweet_data` (Twitter 专用) | `node.metadata.tweet_data` | Twitter API v2 增强数据 |
+
+##### 四、测试夹具中的字段映射验证
+
+**验证 1：Video Embed 渲染器测试** (`ghost/core/test/unit/server/services/koenig/node-renderers/embed-renderer.test.js:5-25`)
+
+```javascript
+function getTestData(overrides = {}) {
+    return {
+        isEmpty: () => false,
+        html: '<iframe width="200" height="113" src="https://www.youtube.com/embed/7hCPODjJO7s?feature=oembed">...</iframe>',
+        metadata: {
+            author_name: 'Bad Obsession Motorsport',
+            author_url: 'https://www.youtube.com/@BadObsessionMotorsport',
+            height: 113,
+            provider_name: 'YouTube',
+            provider_url: 'https://www.youtube.com/',
+            thumbnail_height: 360,
+            thumbnail_url: 'https://i.ytimg.com/vi/7hCPODjJO7s/hqdefault.jpg',
+            thumbnail_width: '480',
+            title: 'Project Binky - Episode 1...',
+            version: '1.0',
+            width: 200
+        },
+        embedType: 'video',  // ← oEmbed.type → node.embedType
+        ...overrides
+    };
+}
+```
+
+**对应关系**：
+- `node.html` ← `oembed.html`
+- `node.embedType: 'video'` ← `oembed.type: 'video'`
+- `node.metadata.*` ← oEmbed 响应中除 `html` 外的所有字段
+
+**验证 2：oEmbed E2E 测试** (`ghost/core/test/e2e-api/admin/oembed.test.js:44-61`)
+
+```javascript
+// YouTube oEmbed API mock 响应
+nock('https://www.youtube.com')
+    .get('/oembed')
+    .query(true)
+    .reply(200, {
+        html: '<iframe width="480" height="270" src="https://www.youtube.com/embed/E5yFcdPAGv0?feature=oembed">...</iframe>',
+        thumbnail_width: 480,
+        width: 480,
+        author_url: 'https://www.youtube.com/user/gorillaz',
+        height: 270,
+        thumbnail_height: 360,
+        provider_name: 'YouTube',
+        title: 'Gorillaz - Humility (Official Video)',
+        provider_url: 'https://www.youtube.com/',
+        author_name: 'Gorillaz',
+        version: '1.0',
+        thumbnail_url: 'https://i.ytimg.com/vi/E5yFcdPAGv0/hqdefault.jpg',
+        type: 'video'
+    });
+```
+
+API 返回后，这些字段被映射到 Lexical embed 节点中。
+
+**验证 3：Twitter Provider 测试** (`ghost/core/test/unit/server/services/oembed/twitter-embed.test.js:78-103`)
+
+```javascript
+// Twitter API v2 响应
+nock('https://api.twitter.com')
+    .get('/2/tweets/1630581157568839683')
+    .query(true)
+    .reply(200, {
+        data: {
+            conversation_id: '1630581157568839683',
+            public_metrics: {
+                retweet_count: 6,
+                reply_count: 1,
+                like_count: 27
+            }
+        },
+        includes: {
+            verified: false,
+            description: 'some description',
+            location: 'someplace, somewhere'
+        }
+    });
+
+// 最终 oembedData 包含
+assert.equal(oembedData.type, 'twitter');  // ← embedType
+assert.ok(oembedData.data);  // ← tweet_data.data
+assert.ok(oembedData.includes);  // ← tweet_data.includes
+```
+
+注意：在 `twitter-oembed-provider.js` 中，Twitter API 响应被存储为：
+```javascript
+oembedData.tweet_data = body.data;
+oembedData.tweet_data.includes = body.includes;
+```
+
+这意味着最终 Lexical 节点中：
+```javascript
+{
+    embedType: 'twitter',
+    html: '<blockquote>...</blockquote>',
+    metadata: {
+        // 标准 oEmbed 字段
+        title: '...',
+        author_name: '...',
+        
+        // Twitter 增强字段
+        tweet_data: {
+            id: '...',
+            text: '...',
+            public_metrics: {...},
+            includes: {
+                users: [...],
+                media: [...]
+            }
+        }
+    }
+}
+```
+
+##### 五、渲染器中的字段使用验证
+
+**Twitter 渲染器** (`ghost/core/core/server/services/koenig/node-renderers/embed/types/twitter.js:12-156`)
+
+```javascript
+const metadata = node.metadata;
+const tweetData = metadata && metadata.tweet_data;  // ← 读取 tweet_data
+const isEmail = options.target === 'email';
+
+if (tweetData && isEmail) {
+    const tweetId = tweetData.id;
+    const authorUser = tweetData.users && tweetData.users.find(user => user.id === tweetData.author_id);
+    const retweetCount = numberFormatter.format(tweetData.public_metrics.retweet_count);
+    const likeCount = numberFormatter.format(tweetData.public_metrics.like_count);
+    // ...
+}
+```
+
+**Video Embed 渲染器** (`ghost/core/core/server/services/koenig/node-renderers/embed-renderer.js:22-61`)
+
+```javascript
+const isEmail = options.target === 'email';
+const metadata = node.metadata;
+const url = node.url;  // ← 原始 URL
+const isVideoWithThumbnail = node.embedType === 'video' 
+    && metadata 
+    && metadata.thumbnail_url;  // ← 读取 thumbnail_url
+
+if (isEmail && isVideoWithThumbnail) {
+    const thumbnailAspectRatio = metadata.thumbnail_width / metadata.thumbnail_height;
+    // 使用 thumbnail_url 构建邮件预览
+} else {
+    figure.innerHTML = node.html;  // ← 读取 html
+}
+```
+
+##### 六、字段缺失时的回退条件
+
+基于渲染器代码，回退触发条件：
+
+| 字段 | 检查位置 | 回退条件 |
+|-----|---------|---------|
+| `metadata.tweet_data` | `twitter.js:12` | `!metadata.tweet_data` 或 `metadata.tweet_data === undefined` |
+| `metadata.thumbnail_url` | `embed-renderer.js:25` | `!metadata` 或 `!metadata.thumbnail_url` |
+
+**回退逻辑路径**：
+
+```
+Twitter 渲染器 (twitter.js)
+    ├─→ tweetData 存在 AND isEmail
+    │       └─→ 专用邮件渲染（<table> 卡片）
+    └─→ 否则（tweetData 缺失 或 非邮件）
+            └─→ 回退：node.html（<blockquote> + script）
+
+Video Embed 渲染器 (embed-renderer.js)
+    ├─→ isEmail AND embedType === 'video' AND metadata.thumbnail_url
+    │       └─→ 专用邮件渲染（缩略图预览 + 链接）
+    └─→ 否则
+            └─→ 回退：node.html（<iframe>）
+```
+
+##### 七、字段映射流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     oEmbed API 响应                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│  {                                                                      │
+│    "html": "<iframe>...</iframe>",                     ← node.html       │
+│    "type": "video",                                   ← node.embedType  │
+│    "title": "...",                                    ← metadata.title  │
+│    "thumbnail_url": "https://...",               ← metadata.thumbnail   │
+│    "author_name": "...",                          ← metadata.author_name │
+│    "tweet_data": { ... }              (Twitter 专用) ← metadata.tweet_data│
+│  }                                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ 字段映射（@tryghost/koenig-lexical）
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Lexical embed 节点                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│  {                                                                      │
+│    "type": "embed",                                                     │
+│    "version": 1,                                                        │
+│    "url": "https://youtube.com/watch?v=xxx",      ← 原始 URL           │
+│    "embedType": "video",                          ← oEmbed.type         │
+│    "html": "<iframe>...</iframe>",                  ← oEmbed.html        │
+│    "metadata": {                                                         │
+│      "title": "...",                               ← oEmbed.title       │
+│      "thumbnail_url": "https://...",              ← oEmbed.thumbnail_* │
+│      "thumbnail_width": 480,                                              │
+│      "thumbnail_height": 360,                                             │
+│      "author_name": "...",                                               │
+│      "author_url": "https://...",                                        │
+│      "provider_name": "YouTube",                                         │
+│      "version": "1.0",                                                   │
+│      "tweet_data": { ... }              (Twitter 专用)                    │
+│    },                                                                     │
+│    "caption": ""                                                         │
+│  }                                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ 持久化
+                    posts.lexical 字段（JSON 字符串）
+```
+
 ### 5.4 外部媒体内联
 
 **服务**: `ghost/core/core/server/services/media-inliner/external-media-inliner.js`
@@ -1165,13 +1510,28 @@ function renderTemplate(node, document, options) {
 
 6. **插件化渲染器**: 自定义节点渲染器采用注册机制，易于扩展新的卡片类型
 
-7. **Embed 分层渲染架构**:
+7. **oEmbed Provider 架构**:
+   - 自定义 Provider 注册机制（Twitter、NFT）
+   - 四层回退：自定义 Provider → 已知 Provider 列表 → 页面 HTML 解析 → Bookmark 卡片
+   - Twitter Provider 额外调用 Twitter API v2 获取增强数据（`tweet_data`）
+
+8. **元数据一次获取，终身复用**:
+   - `tweet_data` 和 `thumbnail_url` 在插入时一次性获取
+   - 完整存储在 Lexical JSON 中
+   - 后续渲染（Web、Email）无需再次调用外部 API
+   - 保证离线状态下也能正常渲染
+
+9. **Embed 分层渲染架构**:
    - 第一层：按 `embedType` 路由（Twitter 专用 vs 通用）
    - 第二层：按 `target` 分支（Web vs Email）
    - 第三层：按元数据可用性降级（有 thumbnail/tweet_data vs 无）
 
-8. **Twitter 邮件专用渲染**: 使用 Twitter API 结构化数据（`tweet_data`）重新构建邮件兼容卡片，避免依赖前端 JS
+10. **Twitter 邮件专用渲染**: 使用 Twitter API 结构化数据（`tweet_data`）重新构建邮件兼容卡片，避免依赖前端 JS
 
-9. **视频邮件降级策略**: `<iframe>` → 缩略图预览 + 链接，同时支持现代客户端和 Outlook（VML）
+11. **视频邮件降级策略**: `<iframe>` → 缩略图预览 + 链接，同时支持现代客户端和 Outlook（VML）
 
-10. **渐进式回退机制**: 每种 embed 类型都有多层回退：专用渲染 → 结构化数据渲染 → 原始 HTML，确保最差情况下也能显示内容
+12. **渐进式回退机制**: 每种 embed 类型都有多层回退：专用渲染 → 结构化数据渲染 → 原始 HTML，确保最差情况下也能显示内容
+
+13. **邮件环境限制感知**: 专用渲染器设计明确考虑了邮件客户端的限制：
+    - Twitter：JS 不执行 → 使用结构化数据构建 `<table>`
+    - Video：iframe 不支持 → 使用图片预览 + 链接
