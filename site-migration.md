@@ -258,7 +258,27 @@ replaceImage = function (markdown, image) {
 
 ### 2.5 Step 3: doImport() 详解
 
-**按 importers 数组顺序执行** (`import-manager.js:101`):
+**串行执行机制** (`import-manager.js:411-424`):
+
+```javascript
+async doImport(importData, importOptions) {
+    for (const importer of this.importers) {
+        if (Object.prototype.hasOwnProperty.call(importData, importer.type)) {
+            importResults[importer.type] = await importer.doImport(
+                importData[importer.type], importOptions);
+        }
+    }
+    return importResults;
+}
+```
+
+**关键事实：**
+- `for...of` + `await` 串行执行
+- 前序 importer 抛错 → 循环立即停止 → 后续 importer 不会执行
+- 错误抛出到外层 try-catch
+
+**执行顺序** (`import-manager.js:101`):
+
 ```javascript
 this.importers = [
     imageImporter,        // ① 保存图片
@@ -269,7 +289,30 @@ this.importers = [
 ];
 ```
 
+**失败中断逻辑：
+
+```
+① imageImporter.doImport()
+    ├─ 成功 → 继续 ②
+    └─ 失败 → throw → ②③④⑤ 全部跳过 → DataImporter 不执行
+
+② mediaImporter.doImport()
+    ├─ 成功 → 继续 ③
+    └─ 失败 → throw → ③④⑤ 全部跳过 → DataImporter 不执行
+
+③ filesImporter.doImport()
+    ├─ 成功 → 继续 ④
+    └─ 失败 → throw → ④⑤ 全部跳过 → DataImporter 不执行
+
+④ RevueImporter.doImport() → 空操作，继续 ⑤
+
+⑤ DataImporter.doImport() → 只有 ①②③④ 都成功才执行
+```
+
+**结论：**资源阶段任意一步失败，数据库导入根本不会开始**
+
 **①-③ 资源文件保存** (`content-file-importer.js:117-125`):
+
 ```javascript
 doImport(contentFilesData) {
     return Promise.all(contentFilesData.map(function (contentFile) {
@@ -277,6 +320,7 @@ doImport(contentFilesData) {
     }));
 }
 ```
+
 - 无事务保护
 - 无回滚机制
 - 失败后已保存的文件保留
@@ -468,65 +512,140 @@ products 表有 `monthly_price_id` 和 `yearly_price_id` 字段引用 stripe_pri
 
 ## 四、回滚边界分析
 
-### 4.1 导入流程中的事务边界
+### 4.1 两种失败场景
+
+由于 `doImport()` 是 `for...of` + `await` 串行执行，存在两种本质不同的失败场景：
+
+| 场景 | 失败位置 | DataImporter 是否执行 |
+|------|----------|----------------------|
+| **A. 资源阶段失败** | ①/②/③ 抛错 | ❌ 不执行 |
+| **B. 数据阶段失败** | ⑤ 内部抛错 | ✅ 已执行，事务回滚 |
+
+### 4.2 场景 A：资源阶段失败
+
+**发生时机：** `imageImporter`、`mediaImporter` 或 `filesImporter` 的 `doImport()` 抛错
+
+**执行流程：**
 
 ```
-时间线 ────────────────────────────────────────────────────────►
-
-Step 1: loadFile()
-├─ Zip 解压到临时目录                    ── 无事务，失败则抛错
-└─ Handlers 计算文件元数据               ── 无事务，失败则抛错
-
-Step 2: preProcess()
-├─ 路径替换（修改内存中的 importData）   ── 无副作用
-└─ Revue 格式转换（修改内存数据）         ── 无副作用
-
+用户上传 zip
+    ↓
+Step 1: loadFile()          ✅ 完成
+Step 2: preProcess()        ✅ 完成
 Step 3: doImport()
-├─ ① imageImporter.doImport()
-│  └─ 保存图片到存储                      ── ❌ 无事务，不可回滚
-├─ ② mediaImporter.doImport()
-│  └─ 保存媒体到存储                      ── ❌ 无事务，不可回滚
-├─ ③ filesImporter.doImport()
-│  └─ 保存附件到存储                      ── ❌ 无事务，不可回滚
-├─ ④ RevueImporter.doImport()
-│  └─ 空操作                              ── 无副作用
-└─ ⑤ DataImporter.doImport()
-   └─ 数据库事务开始
-      ├─ users 导入                       ── ✅ 事务保护
-      ├─ roles 导入                       ── ✅ 事务保护
-      ├─ tags 导入                        ── ✅ 事务保护
-      ├─ newsletters 导入                 ── ✅ 事务保护
-      ├─ settings 导入                    ── ✅ 事务保护
-      ├─ products 导入                    ── ✅ 事务保护
-      ├─ stripe_products 导入             ── ✅ 事务保护
-      ├─ stripe_prices 导入               ── ✅ 事务保护
-      ├─ posts 导入                       ── ✅ 事务保护
-      ├─ custom_theme_settings 导入       ── ✅ 事务保护
-      ├─ revue_subscribers 导入           ── ✅ 事务保护
-      ├─ Stripe 循环引用修复              ── ✅ 事务保护
-      ├─ 检测 errors.length > 0 ?
-      │  ├─ Yes → throw errors            ── 触发事务回滚
-      │  └─ No → commit                   ── 事务提交
-      └─ 数据库事务结束
-
-Step 4-6: 收尾
-├─ generateReport()                       ── 无副作用
-├─ cleanUp()                              ── 删除临时解压目录
-└─ 发送邮件通知                           ── 无论成功失败
+    ├─ ① imageImporter.doImport()
+    │   ├─ store.save() 逐个保存图片
+    │   ├─ ...
+    │   └─ 第 N 个图片保存失败 → throw error
+    ├─ ② mediaImporter        ← 不会执行
+    ├─ ③ filesImporter        ← 不会执行
+    ├─ ④ RevueImporter        ← 不会执行
+    └─ ⑤ DataImporter         ← 不会执行
+    ↓
+catch 捕获错误
+    ↓
+cleanUp() → 删除临时目录
+    ↓
+发送失败邮件
 ```
 
-### 4.2 回滚边界总结表
+**最终状态（场景 A）：**
 
-| 阶段 | 操作内容 | 事务保护 | 失败后状态 |
-|------|----------|----------|-----------|
-| loadFile | Zip 解压、Handlers 计算路径 | ❌ 无 | 临时目录在 cleanUp 中删除 |
-| preProcess | 路径替换、格式转换 | - | 仅内存操作，无持久化 |
-| imageImporter.doImport | 保存图片到存储 | ❌ 无 | **已保存的图片保留（孤立文件）** |
-| mediaImporter.doImport | 保存媒体到存储 | ❌ 无 | **已保存的媒体保留（孤立文件）** |
-| filesImporter.doImport | 保存附件到存储 | ❌ 无 | **已保存的附件保留（孤立文件）** |
-| DataImporter.doImport | 所有数据库操作 | ✅ 有 | **完全回滚** |
+| 数据类型 | 状态 | 说明 |
+|----------|------|------|
+| 已保存的图片/媒体/附件 | ⚠️ 部分保留 | `Promise.all` 中已完成的 save 不会回滚 |
+| 数据库结构数据 | ✅ 未修改 | DataImporter 根本没有执行 |
+| 临时解压目录 | ✅ 已清理 | cleanUp() 在 finally 中执行 |
+| 导入标记标签 | ✅ 不存在 | DataImporter 未执行 |
 
-### 4.3 错误分类：Errors vs Problems
+**关键事实：场景 A 下数据库完全干净，只有部分资源文件成为孤立文件**
+
+### 4.3 场景 B：数据阶段失败
+
+**发生时机：** `DataImporter` 内部执行过程中产生 `errors` 或抛出异常
+
+**前提条件：** ①②③④ 全部成功执行
+
+**执行流程：**
+
+```
+用户上传 zip
+    ↓
+Step 1: loadFile()          ✅ 完成
+Step 2: preProcess()        ✅ 完成
+Step 3: doImport()
+    ├─ ① imageImporter.doImport()    ✅ 所有图片保存完毕
+    ├─ ② mediaImporter.doImport()    ✅ 所有媒体保存完毕
+    ├─ ③ filesImporter.doImport()    ✅ 所有附件保存完毕
+    ├─ ④ RevueImporter.doImport()    ✅ 空操作
+    └─ ⑤ DataImporter.doImport()
+        └─ 数据库事务开始
+           ├─ UsersImporter           ✅
+           ├─ RolesImporter           ✅
+           ├─ TagsImporter            ✅
+           ├─ ...
+           ├─ PostsImporter
+           │   ├─ ...
+           │   └─ 某篇文章验证失败 → error 加入 errors 数组
+           ├─ ...
+           ├─ 检测 errors.length > 0
+           │   └─ Yes → throw errors → 事务回滚
+           └─ 数据库事务结束
+    ↓
+catch 捕获错误
+    ↓
+cleanUp() → 删除临时目录
+    ↓
+发送失败邮件
+```
+
+**最终状态（场景 B）：**
+
+| 数据类型 | 状态 | 说明 |
+|----------|------|------|
+| 已保存的图片/媒体/附件 | ⚠️ 全部保留 | 在 DataImporter 之前已完成，无事务保护 |
+| 数据库结构数据 | ❌ 已回滚 | 事务保证原子性 |
+| 临时解压目录 | ✅ 已清理 | cleanUp() 在 finally 中执行 |
+| 导入标记标签 | ❌ 已回滚 | 在事务内创建，随事务回滚 |
+
+### 4.4 回滚边界总结表
+
+| 阶段 | 操作内容 | 事务保护 | 场景 A 失败后 | 场景 B 失败后 |
+|------|----------|----------|--------------|--------------|
+| loadFile | Zip 解压、Handlers 计算路径 | ❌ 无 | 临时目录已清理 | 临时目录已清理 |
+| preProcess | 路径替换、格式转换 | - | 无持久化 | 无持久化 |
+| imageImporter.doImport | 保存图片到存储 | ❌ 无 | **部分保留** | **全部保留** |
+| mediaImporter.doImport | 保存媒体到存储 | ❌ 无 | **未执行** | **全部保留** |
+| filesImporter.doImport | 保存附件到存储 | ❌ 无 | **未执行** | **全部保留** |
+| DataImporter.doImport | 所有数据库操作 | ✅ 有 | **未执行** | **完全回滚** |
+
+### 4.5 DataImporter 内部事务边界
+
+所有子 importer 的操作都在同一个事务内 (`data-importer.js:124-197`)：
+
+```javascript
+return models.Base.transaction(async function (transacting) {
+    modelOptions.transacting = transacting;
+
+    await sequence(ops);  // 顺序执行所有子 importer
+
+    if (errors.length > 0) {
+        throw errors;  // 触发事务回滚
+    }
+
+    return { ... };
+});
+```
+
+**事务内执行顺序：**
+1. UsersImporter → RolesImporter → TagsImporter → NewslettersImporter
+2. SettingsImporter → ProductsImporter → StripeProductsImporter → StripePricesImporter
+3. PostsImporter → CustomThemeSettingsImporter → RevueSubscriberImporter
+4. Stripe 循环引用修复
+
+**任何一步产生 errors 都会导致整个事务回滚**
+
+### 4.6 错误分类：Errors vs Problems
 
 `BaseImporter.handleError()` (`base.js:111-174`) 区分两种错误：
 
@@ -542,18 +661,7 @@ Step 4-6: 收尾
 - 关联的 tag/author 找不到 → 移除关联或 fallback
 - 文章必须有作者 → 所有作者丢失时 fallback 到 Owner
 
-### 4.4 导入失败后的残留数据
-
-**场景：DataImporter 事务回滚**
-
-| 数据类型 | 状态 | 说明 |
-|----------|------|------|
-| 已保存的图片/媒体/附件 | ⚠️ 保留 | 存储中存在但数据库无引用 |
-| 数据库结构数据 | ❌ 已回滚 | 事务保证原子性 |
-| 临时解压目录 | ✅ 已清理 | cleanUp() 在 finally 中执行 |
-| 导入标记标签 | ❌ 已回滚 | 自动创建的 `#Import YYYY-MM-DD HH:mm` 标签 |
-
-### 4.5 清理机制
+### 4.7 清理机制
 
 `cleanUp()` (`import-manager.js:441-457`):
 - 在 `finally` 块中执行，无论成功失败
@@ -655,27 +763,63 @@ ImportManager.importFromFile()
 
 ### 5.3 迁移失败场景分析
 
-**场景 1：图片保存失败（imageImporter.doImport 抛错）**
-- 已保存的部分图片：保留
-- 未保存的图片：跳过
-- 数据库操作：未执行
-- 结果：部分图片孤立
+**场景 A：资源阶段失败（串行中断）**
 
-**场景 2：DataImporter 中 users 导入失败**
-- 已保存的图片/媒体/附件：保留（孤立）
-- 数据库操作：完全回滚
-- 结果：资源文件孤立，结构数据干净
+**子场景 A-1：imageImporter.doImport 抛错**
+- 执行到 `imageImporter.doImport()` 时失败
+- `for...of` 循环立即停止
+- `mediaImporter`、`filesImporter`、`DataImporter` 都不会执行
+- 结果：
+  - 已保存的部分图片：保留（孤立）
+  - 媒体、附件：未保存
+  - 数据库：完全干净，未做任何修改
 
-**场景 3：DataImporter 中 posts 导入产生 problems**
-- 部分文章的关联被移除或 fallback
+**子场景 A-2：mediaImporter.doImport 抛错**
+- `imageImporter` 已全部完成
+- 执行到 `mediaImporter.doImport()` 时失败
+- `filesImporter`、`DataImporter` 不会执行
+- 结果：
+  - 图片：全部保留（孤立）
+  - 已保存的部分媒体：保留（孤立）
+  - 附件：未保存
+  - 数据库：完全干净，未做任何修改
+
+**子场景 A-3：filesImporter.doImport 抛错**
+- `imageImporter`、`mediaImporter` 已全部完成
+- 执行到 `filesImporter.doImport()` 时失败
+- `DataImporter` 不会执行
+- 结果：
+  - 图片、媒体：全部保留（孤立）
+  - 已保存的部分附件：保留（孤立）
+  - 数据库：完全干净，未做任何修改
+
+**场景 B：数据阶段失败**
+
+**前提条件：** `imageImporter`、`mediaImporter`、`filesImporter` 全部成功完成
+
+**子场景 B-1：DataImporter 中 users 导入产生 errors**
+- 图片、媒体、附件：全部已保存
+- 数据库事务回滚
+- 结果：
+  - 资源文件：全部保留（孤立）
+  - 数据库：完全干净，无任何导入数据
+
+**子场景 B-2：DataImporter 中 posts 导入产生 errors**
+- 图片、媒体、附件：全部已保存
+- 数据库事务回滚
+- 结果：
+  - 资源文件：全部保留（孤立）
+  - 数据库：完全干净，无任何导入数据
+
+**场景 C：数据阶段产生 problems（非错误）**
+
+**子场景 C-1：DataImporter 中 posts 导入产生 problems**
 - problems 被记录但不触发回滚
 - 事务提交
-- 结果：导入完成但有警告（邮件通知包含 problems）
-
-**场景 4：DataImporter 中 posts 导入产生 errors**
-- 已保存的图片/媒体/附件：保留（孤立）
-- 数据库操作：完全回滚
-- 结果：资源文件孤立，结构数据干净
+- 结果：
+  - 资源文件：全部保留且有引用
+  - 数据库：成功导入，但部分数据被自动修复
+  - 用户需检查邮件中的 problems 列表
 
 ---
 
