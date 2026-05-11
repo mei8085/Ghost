@@ -464,7 +464,245 @@ it('authenticatePrivateSession should redirect when stored access code is empty'
 - `ghost-private`：通过**哈希比对**实现无状态失效
 - `ghost-members-ssr`：通过 **transient_id 数据库查询**实现（可在数据库层面撤销）
 
-### 0.9 与 Members 权限系统的职责边界
+### 0.9 防暴力破解链路
+
+#### 0.9.1 POST 路由中的触发点
+
+**文件**：`ghost/core/core/frontend/apps/private-blogging/lib/router.js` 第 36-42 行
+
+```javascript
+privateRouter
+    .route('/')
+    .post(
+        bodyParser.urlencoded({extended: true}),
+        middleware.redirectPrivateToHomeIfLoggedIn,
+        web.shared.middleware.brute.privateBlog,  // ← 防暴力破解中间件
+        middleware.doLoginToPrivateSite,
+        _renderer
+    );
+```
+
+**中间件链顺序**：
+```
+POST /private/
+    │
+    ├─► bodyParser: 解析 POST body
+    │
+    ├─► redirectPrivateToHomeIfLoggedIn: 已登录则直接跳转首页
+    │
+    ├─► brute.privateBlog: 检查 IP 限流计数（关键防破解）
+    │       ├─► 未超限 → next() 继续
+    │       └─► 超限 → next(err) 抛出 TooManyRequestsError
+    │
+    ├─► doLoginToPrivateSite: 实际验证密码（仅在限流通后执行）
+    │       ├─► 密码正确 → 重定向
+    │       └─► 密码错误 → 设置 res.error → _renderer 显示错误
+    │
+    └─► _renderer: 渲染 private.hbs
+```
+
+#### 0.9.2 限流配置默认值
+
+**默认配置**：`ghost/core/core/shared/config/defaults.json` 第 104-108 行
+
+```json
+"private_block": {
+    "minWait": 3600000,      // 最小等待时间：1 小时（毫秒）
+    "maxWait": 3600000,      // 最大等待时间：1 小时（毫秒）
+    "lifetime": 3600,        // 计数有效期：1 小时（秒）
+    "freeRetries": 99        // 免费重试次数：99 次
+}
+```
+
+**测试环境配置**：`config.testing.json` 第 63-67 行，`config.testing-mysql.json` 第 67-71 行
+```json
+"private_block": {
+    "minWait": 3600000,
+    "maxWait": 3600000,
+    "lifetime": 3600,
+    "freeRetries": 99        // 测试环境同样为 99 次
+}
+```
+
+**实际含义**：
+- **100 次尝试**：`freeRetries + 1 = 99 + 1 = 100` 次请求
+- **1 小时窗口**：`lifetime = 3600` 秒内计数有效
+- **锁定 1 小时**：`minWait = maxWait = 3600000` ms（无递增，固定锁定）
+- **按 IP 限流**：使用 `req.ip` 作为限流键（`ignoreIP: false`）
+
+#### 0.9.3 brute.privateBlog 中间件实现
+
+**文件**：`ghost/core/core/server/web/shared/middleware/brute.js` 第 78-85 行
+
+```javascript
+privateBlog(req, res, next) {
+    return spamPrevention.privateBlog().getMiddleware({
+        ignoreIP: false,      // 按 IP 限流
+        key(_req, _res, _next) {
+            _next('privateblog');  // 固定 key = 'privateblog'
+        }
+    })(req, res, next);
+}
+```
+
+**限流键**：`privateblog_<IP地址>` 存储在 `brute` 数据库表
+
+#### 0.9.4 限流计数与数据库存储
+
+**文件**：`ghost/core/core/server/web/shared/middleware/api/spam-prevention.js` 第 439-472 行
+
+```javascript
+const privateBlog = () => {
+    const ExpressBrute = require('express-brute');
+    const BruteKnex = require('brute-knex');
+    const db = require('../../../../data/db');
+
+    // 使用 MySQL 持久化存储（而非内存）
+    store = store || new BruteKnex({
+        tablename: 'brute',   // 数据库表名
+        createTable: false,
+        knex: db.knex
+    });
+
+    privateBlogInstance = privateBlogInstance || new ExpressBrute(store,
+        extend({
+            attachResetToRequest: false,  // 不自动在成功时重置
+            failCallback(req, res, next, nextValidRequestDate) {
+                // 超限后：先记录错误日志
+                logging.error(new errors.TooManyRequestsError({
+                    message: tpl(messages.tooManySigninAttempts.error, {
+                        rateSigninAttempts: spamPrivateBlock.freeRetries + 1 || 5,  // 100
+                        rateSigninPeriod: spamPrivateBlock.lifetime || 60 * 60     // 3600s
+                    }),
+                    context: tpl(messages.tooManySigninAttempts.context)
+                }));
+
+                // 然后抛出错误
+                return next(new errors.TooManyRequestsError({
+                    message: `Too many private sign-in attempts try again in ${moment(nextValidRequestDate).fromNow(true)}`
+                }));
+            },
+            handleStoreError: handleStoreError
+        }, pick(spamPrivateBlock, spamConfigKeys))
+    );
+
+    return privateBlogInstance;
+};
+```
+
+**存储特性**：
+- 数据库表：`brute`
+- 数据持久化：重启后计数仍然有效
+- 无自动重置：`attachResetToRequest: false`，登录成功后不会自动清空计数
+
+#### 0.9.5 限流后的错误返回路径
+
+**请求管线中的错误处理顺序**（`site.js` 第 155-170 行）：
+
+```
+siteApp.use(SiteRouter);      // 处理请求，可能抛出 TooManyRequestsError
+siteApp.use(errorHandler.pageNotFound);
+privateBlogging.setupErrorHandling(siteApp);  // 404 专用处理
+siteApp.use(mw.errorHandler.handleThemeResponse);  // ← 捕获并渲染所有其他错误
+```
+
+**handleThemeResponse 中间件链**（`error-handler.js` 第 122-133 行）：
+
+```javascript
+module.exports.handleThemeResponse = [
+    prepareError,                   // 规范化错误（设置 statusCode 等）
+    prepareErrorCacheControl(),     // 设置错误响应的缓存头
+    sentry.errorHandler,            // 上报到 Sentry
+    prepareStack,                   // 处理错误堆栈
+    themeErrorRenderer              // 渲染错误页面（关键！）
+];
+```
+
+**themeErrorRenderer 关键逻辑**（`error-handler.js` 第 42-120 行）：
+
+```javascript
+const themeErrorRenderer = function themeErrorRenderer(err, req, res, next) {
+    // 静态文件返回纯文本
+    const hasExtension = Boolean(path.extname(req.path));
+    const isStaticFile = (hasExtension || err.code === 'STATIC_FILE_NOT_FOUND');
+    if (isStaticFile) {
+        res.status(statusCode);
+        res.type('text/plain');
+        return res.send(message);
+    }
+
+    // HTML 页面使用主题的 error.hbs 模板
+    const data = {
+        message: err.message,      // "Too many private sign-in attempts try again in an hour"
+        statusCode: err.statusCode, // 429
+        errorDetails: err.errorDetails || []
+    };
+
+    renderer.templates.setTemplate(req, res);  // 选择 error.hbs 模板
+
+    res.render(res._template, data, (_err, html) => {
+        // ... 渲染主题的错误页面
+    });
+};
+```
+
+**完整错误返回链路**：
+
+```
+POST /private/ (超过 100 次尝试)
+    │
+    ├─► brute.privateBlog
+    │       │
+    │       └─► failCallback → next(TooManyRequestsError)
+    │
+    ├─► 错误落入 handleThemeResponse 链
+    │       │
+    │       ├─► prepareError: err.statusCode = 429
+    │       │
+    │       ├─► prepareErrorCacheControl: 设置缓存头
+    │       │
+    │       ├─► sentry.errorHandler: 上报
+    │       │
+    │       ├─► prepareStack: 处理堆栈
+    │       │
+    │       └─► themeErrorRenderer
+    │               │
+    │               ├─► 非静态文件
+    │               │
+    │               └─► 使用主题的 error.hbs 渲染
+    │                       │
+    │                       └─► data = {
+    │                               message: "Too many private sign-in attempts try again in an hour",
+    │                               statusCode: 429
+    │                           }
+    │
+    └─► 返回 429 页面（使用当前主题的 error.hbs 模板）
+```
+
+**⚠️ 关键注意**：
+- 限流错误**不会**使用 `private.hbs` 模板渲染
+- 限流错误使用**当前激活主题的 `error.hbs`** 模板
+- 这意味着：被限流的用户看到的是主题的错误页，而不是私密站点的登录页
+- 此时用户仍处于 Private Site 模式，但无法回到 `/private/` 重试，需要等锁定期结束
+
+#### 0.9.6 密码错误 vs 限流错误的差异
+
+| 场景 | 触发条件 | 错误类型 | 返回模板 | 用户体验 |
+|------|----------|----------|----------|----------|
+| **密码错误** | 密码不匹配 | 设置 `res.error` | `private.hbs`（第 82-86 行） | 仍在 `/private/` 页面，显示红色错误提示"Incorrect access code"，可立即重试 |
+| **限流超限** | 100 次失败/锁定期内 | `TooManyRequestsError` | 主题的 `error.hbs` | 离开 `/private/` 页面，显示 429 错误，无法重试直到锁定结束 |
+
+**private.hbs 中的密码错误显示**（第 82-86 行）：
+```handlebars
+<div class="form-group gh-private-access-input-wrap{{#if error}} error{{/if}}">
+    {{input_password ...}}
+    {{#if error}}
+        <p class="main-error">{{error.message}}</p>
+    {{/if}}
+</div>
+```
+
+### 0.10 与 Members 权限系统的职责边界
 
 | 维度 | Private Site | Members Visibility / Access |
 |------|-------------|----------------------------|
@@ -472,7 +710,11 @@ it('authenticatePrivateSession should redirect when stored access code is empty'
 | **触发位置** | 请求管线最前端（`filterPrivateRoutes`） | API 序列化层（`post-gating.js`） |
 | **认证方式** | 统一访问密码 | 会员系统（Magic Link / 订阅） |
 | **会话 Cookie** | `ghost-private`（cookie-session） | `ghost-members-ssr`（Keygrip 签名） |
+| **Cookie 签名** | `signed: false`（无签名） | `signed: true`（Keygrip + `.sig` cookie） |
+| **会话验证** | `SHA256(password + salt)` 哈希比对 | transient_id 数据库查询 |
 | **会话时长** | 30 天（`30 * 24 * 60 * 60 * 1000` ms） | 约 6 个月（`1000 * 60 * 60 * 24 * 184` ms） |
+| **密码/订阅变更后** | 所有会话立即失效（哈希比对不通过） | 依赖 transient_id 状态（需数据库层面处理） |
+| **缓存策略** | `Cache-Control: no-cache, private, no-store...`（完全不缓存） | 可配置 `cacheMembersContent:enabled`（按 tier 缓存） |
 | **效果** | 未通过 → 重定向到 `/private/` | 未通过 → 裁剪内容 + 设置 `access=false` |
 | **用户感知** | 必须先输入密码才能看到任何内容 | 能看到文章列表，但会员专享内容被裁剪 |
 
