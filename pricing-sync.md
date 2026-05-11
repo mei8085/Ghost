@@ -318,11 +318,11 @@ Stripe Coupon (Stripe API)
 
 #### 2.2.2 Coupon 创建时机
 
-Coupon 创建采用**双重保障机制**：`OfferCreatedEvent` 事件触发创建作为主路径，首次使用懒加载仅作兜底容错。
+Coupon 创建采用**双重保障机制**：`OfferCreatedEvent` 事件触发创建作为主路径，`stripe_coupon_id` 为空时的实时创建作为兜底。
 
 **路径 1：事件触发创建（主路径）** (`payments-service.js:36-38`)
 
-当 Offer 通过 `offersAPI.createOffer()` 创建后，系统立即发出 `OfferCreatedEvent`，事件处理器异步创建 Coupon：
+当 Offer 通过 `offersAPI.createOffer()` 创建后，系统立即发出 `OfferCreatedEvent`，事件处理器异步调用 `getCouponForOffer()` 尝试创建 Coupon：
 
 ```javascript
 DomainEvents.subscribe(OfferCreatedEvent, async (event) => {
@@ -336,9 +336,9 @@ DomainEvents.subscribe(OfferCreatedEvent, async (event) => {
 
 参考: `ghost/core/core/server/services/members/members-api/services/payments-service.js:36-38`
 
-**路径 2：首次使用懒加载（兜底容错）** (`payments-service.js:549-562`)
+**路径 2：`stripe_coupon_id` 为空时实时创建（兜底）** (`payments-service.js:549-562`)
 
-`getCouponForOffer()` 方法内部实现了懒加载逻辑——这是**兜底机制**，仅在事件路径创建失败时触发：
+`getCouponForOffer()` 方法内部实现了懒加载逻辑：**当需要 Coupon 且 `stripe_coupon_id` 为空时，实时创建**。
 
 ```javascript
 async getCouponForOffer(offerId) {
@@ -350,26 +350,37 @@ async getCouponForOffer(offerId) {
     }
     
     if (!row.stripe_coupon_id) {
-        // 兜底：事件路径可能失败（如 Stripe API 临时不可用），实时创建 Coupon
+        // 兜底创建：数据库中 stripe_coupon_id 为空，实时创建 Coupon
         const offer = await this.offersAPI.getOffer({id: offerId});
         await this.createCouponForOffer(offer);
-        return this.getCouponForOffer(offerId);
+        return this.getCouponForOffer(offerId);  // 递归重试
     }
     
     return { id: row.stripe_coupon_id };
 }
 ```
 
-**触发场景（兜底）**：
-- 生成支付链接 `getPaymentLink()` 时（新订阅应用 Offer）
-- 应用 Retention Offer 到已有订阅时
-- 事件路径创建失败后的容错（如 Stripe API 临时不可用）
+**兜底触发条件**（代码实际逻辑）：
+- 需要使用 Coupon（调用 `getCouponForOffer`）
+- Offer 存在且 `discount_type !== 'trial'`
+- 数据库中 `stripe_coupon_id` 为空
+
+**命中兜底的业务场景**：
+- **场景 1：生成支付链接** (`payments-service.js:92`)
+  - 调用 `getPaymentLink()` 创建新订阅时，若 `offer` 参数传入且不为 trial 类型
+  - 代码：`coupon = await this.getCouponForOffer(offer.id);`
+- **场景 2：应用到已有订阅** (`member-controller.js:247`)
+  - 调用 `applyOfferToSubscription()` 应用 Retention Offer 时
+  - 代码：`const coupon = await this._paymentsService.getCouponForOffer(offerId);`
 
 **注意**：
 - `discount_type === 'trial'` 的 Offer **不需要** Stripe Coupon，直接通过 Stripe 的 `trial_period_days` 参数实现
-- 兜底路径的存在不代表事件路径是可选的——事件路径是主路径，兜底仅用于异常恢复
+- 事件路径是创建 Coupon 的主动方式，兜底是被动保障（事件可能未执行或执行失败）
 
-参考: `ghost/core/core/server/services/members/members-api/services/payments-service.js:549-562`
+参考:
+- `ghost/core/core/server/services/members/members-api/services/payments-service.js:549-562`
+- `ghost/core/core/server/services/members/members-api/services/payments-service.js:92`
+- `ghost/core/core/server/services/members/members-api/controllers/member-controller.js:247`
 
 #### 2.2.3 Coupon 创建逻辑
 
@@ -889,7 +900,7 @@ async archiveActiveRetentionOffers(offerId, cadence, options = {}) {
 | 方向 | 本地实体 | Stripe 实体 | 同步触发 |
 |------|----------|-------------|----------|
 | Tier → Stripe | Product + monthly/yearly_price | Product + Price | TierCreatedEvent / TierPriceChangeEvent |
-| Offer → Stripe | Offer | Coupon | OfferCreatedEvent / 首次使用时 |
+| Offer → Stripe | Offer | Coupon | OfferCreatedEvent（主路径）/ 首次使用（兜底容错） |
 | Stripe → Offer | - | Coupon | linkSubscription（处理现有订阅的折扣） |
 
 ### 6.2 价格变更处理
