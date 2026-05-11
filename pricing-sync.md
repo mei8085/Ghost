@@ -318,7 +318,11 @@ Stripe Coupon (Stripe API)
 
 #### 2.2.2 Coupon 创建时机
 
-**方案 1：Offer 创建后延迟创建** (`payments-service.js:36-38`)
+Coupon 创建采用**双重保障机制**：`OfferCreatedEvent` 事件触发创建作为主路径，首次使用懒加载仅作兜底容错。
+
+**路径 1：事件触发创建（主路径）** (`payments-service.js:36-38`)
+
+当 Offer 通过 `offersAPI.createOffer()` 创建后，系统立即发出 `OfferCreatedEvent`，事件处理器异步创建 Coupon：
 
 ```javascript
 DomainEvents.subscribe(OfferCreatedEvent, async (event) => {
@@ -326,9 +330,15 @@ DomainEvents.subscribe(OfferCreatedEvent, async (event) => {
 });
 ```
 
+**触发时机**：
+- 管理员在后台创建 Offer 并保存成功后
+- 事件异步执行，不阻塞 Offer 创建的 API 响应
+
 参考: `ghost/core/core/server/services/members/members-api/services/payments-service.js:36-38`
 
-**方案 2：首次使用时创建** (`payments-service.js:549-562`)
+**路径 2：首次使用懒加载（兜底容错）** (`payments-service.js:549-562`)
+
+`getCouponForOffer()` 方法内部实现了懒加载逻辑——这是**兜底机制**，仅在事件路径创建失败时触发：
 
 ```javascript
 async getCouponForOffer(offerId) {
@@ -336,11 +346,11 @@ async getCouponForOffer(offerId) {
         .query().select('stripe_coupon_id', 'discount_type').first();
     
     if (!row || row.discount_type === 'trial') {
-        return null;
+        return null;  // Trial 类型无需 Coupon
     }
     
     if (!row.stripe_coupon_id) {
-        // 延迟创建 Coupon
+        // 兜底：事件路径可能失败（如 Stripe API 临时不可用），实时创建 Coupon
         const offer = await this.offersAPI.getOffer({id: offerId});
         await this.createCouponForOffer(offer);
         return this.getCouponForOffer(offerId);
@@ -349,6 +359,15 @@ async getCouponForOffer(offerId) {
     return { id: row.stripe_coupon_id };
 }
 ```
+
+**触发场景（兜底）**：
+- 生成支付链接 `getPaymentLink()` 时（新订阅应用 Offer）
+- 应用 Retention Offer 到已有订阅时
+- 事件路径创建失败后的容错（如 Stripe API 临时不可用）
+
+**注意**：
+- `discount_type === 'trial'` 的 Offer **不需要** Stripe Coupon，直接通过 Stripe 的 `trial_period_days` 参数实现
+- 兜底路径的存在不代表事件路径是可选的——事件路径是主路径，兜底仅用于异常恢复
 
 参考: `ghost/core/core/server/services/members/members-api/services/payments-service.js:549-562`
 
@@ -894,6 +913,7 @@ async archiveActiveRetentionOffers(offerId, cadence, options = {}) {
 ### 6.4 关键设计决策
 
 1. **Price 不可变性**：遵循 Stripe 的 Price 不可变设计，价格变更时创建新 Price
-2. **延迟创建 Coupon**：Offer 创建时不立即创建 Stripe Coupon，首次使用时才创建
-3. **Webhook 驱动同步**：订阅状态、折扣过期等变化通过 Stripe Webhook 同步
-4. **保守的 Offer 匹配**：从 Stripe Coupon 创建的 Offer 标记为 archived，避免被误用
+2. **Tier 回流定位链**：从 Stripe Subscription → `stripe_products` 映射表 → 本地 Product，缺失时使用默认付费产品兜底
+3. **Coupon 双重保障**：OfferCreatedEvent 事件触发创建（主路径）+ 首次使用懒加载兜底（容错）
+4. **Webhook 驱动同步**：订阅状态、折扣过期等变化通过 Stripe Webhook 驱动 `linkSubscription()` 同步
+5. **保守的 Offer 反向创建**：从 Stripe Coupon 创建的 Offer 状态设为 archived，避免被误用于新订阅
