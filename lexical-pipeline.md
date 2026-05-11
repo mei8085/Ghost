@@ -1346,6 +1346,298 @@ Video Embed 渲染器 (embed-renderer.js)
                     posts.lexical 字段（JSON 字符串）
 ```
 
+#### 5.3.9 字段映射校正与测试数据对照
+
+本节校正 oEmbed 响应到 Lexical 节点的字段映射，明确 `tweet_data` 的来源与结构，并使用仓库内测试夹具逐字段验证。
+
+##### 一、Twitter Provider 实际代码校正
+
+**位置**: `ghost/core/core/server/services/oembed/twitter-oembed-provider.js:71-72`
+
+**实际赋值逻辑**：
+```javascript
+// Twitter API v2 响应结构
+// GET https://api.twitter.com/2/tweets/{id}?expansions=...
+const body = {
+    data: {
+        id: '1630581157568839683',
+        text: '...',
+        public_metrics: {retweet_count, like_count, ...},
+        author_id: '123456',
+        ...
+    },
+    includes: {
+        users: [{
+            id: '123456',
+            name: '用户名',
+            username: 'username',
+            profile_image_url: 'https://pbs.twimg.com/...'
+        }],
+        media: [{
+            media_key: '3_1630581157568839680',
+            type: 'photo',
+            url: 'https://pbs.twimg.com/...'
+        }]
+    }
+};
+
+// 实际赋值
+oembedData.tweet_data = body.data;
+oembedData.tweet_data.includes = body.includes;
+```
+
+**最终 oembedData 结构**：
+```javascript
+{
+    // 来自 oembed-extractor 的标准 oEmbed 字段
+    html: '<blockquote class="twitter-tweet">...</blockquote><script async src="..."></script>',
+    title: 'Twitter 标题',
+    author_name: '用户名',
+    author_url: 'https://twitter.com/username',
+    provider_name: 'Twitter',
+    type: 'twitter',  // 被覆盖为 'twitter'
+    
+    // 来自 Twitter API v2 的增强数据
+    tweet_data: {
+        id: '1630581157568839683',
+        text: '推文正文...',
+        author_id: '123456',
+        public_metrics: {
+            retweet_count: 6,
+            like_count: 27
+        },
+        includes: {
+            users: [{
+                id: '123456',
+                name: '用户名',
+                username: 'username',
+                profile_image_url: 'https://pbs.twimg.com/...'
+            }],
+            media: [{
+                media_key: '3_1630581157568839680',
+                url: 'https://pbs.twimg.com/...'
+            }]
+        }
+    }
+}
+```
+
+**注意**：`tweet_data` 不是 `oembedData.data`，而是 `body.data`（Twitter API 响应的 data 字段）。`body.includes` 被添加为 `tweet_data.includes`，而不是 `oembedData.includes`。
+
+##### 二、测试文件与实际代码的差异说明
+
+**位置**: `ghost/core/test/unit/server/services/oembed/twitter-embed.test.js`
+
+**测试中的断言** (第 101-102 行):
+```javascript
+assert.ok(oembedData.data);      // ← 与实际代码不符
+assert.ok(oembedData.includes);  // ← 与实际代码不符
+```
+
+**实际代码中的赋值** (第 71-72 行):
+```javascript
+oembedData.tweet_data = body.data;           // ← oembedData.tweet_data
+oembedData.tweet_data.includes = body.includes;  // ← oembedData.tweet_data.includes
+```
+
+**差异分析**：
+- 测试断言检查 `oembedData.data` 和 `oembedData.includes`
+- 实际代码设置的是 `oembedData.tweet_data` 和 `oembedData.tweet_data.includes`
+
+这意味着：
+1. 测试中的 `nockOembedRequest()` 可能模拟的是错误的响应结构
+2. 或者测试本身存在断言错误
+3. **实际行为**：`tweet_data` 位于 `oembedData.tweet_data`，而非 `oembedData.data`
+
+##### 三、写入 Lexical JSON 的实现位置
+
+**核心发现**：字段映射逻辑位于外部包 `@tryghost/koenig-lexical@1.8.1` 中，不在 Ghost 主仓库内。
+
+**数据流转路径**：
+
+```
+服务端 oEmbed API (GET /oembed)
+    ↓ 返回完整 oembedData
+ghost/admin/app/components/koenig-lexical-editor.js:250-256
+    ↓ fetchEmbed 函数原样返回
+    const fetchEmbed = async (url, {type}) => {
+        let oembedEndpoint = this.ghostPaths.url.api('oembed');
+        let response = await this.ajax.request(oembedEndpoint, {
+            data: {url, type}
+        });
+        return response;  // ← 原样返回，不做任何处理
+    };
+    ↓
+@tryghost/koenig-lexical@1.8.1  (外部包，不在主仓库)
+    ↓ 字段映射（此处执行）
+    调用链（推断）：
+    1. fetchEmbed 返回 oembedData
+    2. createEmbedCard(payload) 或类似函数创建卡片
+    3. oembedData.html → node.html
+    4. oembedData.type → node.embedType
+    5. 其他字段（除 html 和 type 外）→ node.metadata
+    ↓
+Lexical embed 节点（存储在 lexical JSON）
+```
+
+**主仓库内可验证的证据**：
+
+1. **Ember 侧原样返回** (`koenig-lexical-editor.js:250-256`):
+   ```javascript
+   return response;  // 直接返回，不做任何字段处理
+   ```
+
+2. **渲染器侧字段读取** (`twitter.js:5,12`):
+   ```javascript
+   const metadata = node.metadata;              // ← 读取 metadata
+   const tweetData = metadata && metadata.tweet_data;  // ← 从 metadata 读取 tweet_data
+   ```
+
+3. **渲染器侧字段读取** (`embed-renderer.js:23,24,25`):
+   ```javascript
+   const metadata = node.metadata;
+   const url = node.url;
+   const isVideoWithThumbnail = node.embedType === 'video' 
+       && metadata 
+       && metadata.thumbnail_url;  // ← 从 metadata 读取 thumbnail_url
+   ```
+
+**推断的字段映射规则**（基于渲染器读取方式）：
+
+| oembedData 字段 | Lexical embed 节点字段 | 证据 |
+|----------------|----------------------|------|
+| `html` | `node.html` | 渲染器读取 `node.html` (twitter.js:10) |
+| `type` | `node.embedType` | 渲染器读取 `node.embedType` (embed-renderer.js:25) |
+| `url` | `node.url` | 渲染器读取 `node.url` (embed-renderer.js:24) |
+| `title` | `node.metadata.title` | 测试数据包含 (`embed-renderer.test.js:18`) |
+| `thumbnail_url` | `node.metadata.thumbnail_url` | 渲染器读取 (`embed-renderer.js:25`) |
+| `tweet_data` | `node.metadata.tweet_data` | 渲染器读取 (`twitter.js:12`) |
+| `author_name` | `node.metadata.author_name` | 测试数据包含 (`embed-renderer.test.js:10`) |
+| `provider_name` | `node.metadata.provider_name` | 测试数据包含 (`embed-renderer.test.js:13`) |
+
+##### 四、仓库内测试夹具逐字段对照
+
+**Video Embed 测试夹具** (`ghost/core/test/unit/server/services/koenig/node-renderers/embed-renderer.test.js:5-25`)
+
+| 测试数据字段 | 对应 oembedData 字段 | Lexical 节点字段 | 渲染器读取位置 |
+|-------------|---------------------|-----------------|---------------|
+| `html: '<iframe>...</iframe>'` | `html` | `node.html` | `embed-renderer.js` 读取 |
+| `embedType: 'video'` | `type: 'video'` | `node.embedType` | `embed-renderer.js:25` |
+| `metadata.thumbnail_url` | `thumbnail_url` | `node.metadata.thumbnail_url` | `embed-renderer.js:25` |
+| `metadata.thumbnail_width` | `thumbnail_width` | `node.metadata.thumbnail_width` | `embed-renderer.js:31` |
+| `metadata.thumbnail_height` | `thumbnail_height` | `node.metadata.thumbnail_height` | `embed-renderer.js:31` |
+| `metadata.title` | `title` | `node.metadata.title` | 测试数据 (`embed-renderer.test.js:18`) |
+| `metadata.author_name` | `author_name` | `node.metadata.author_name` | 测试数据 (`embed-renderer.test.js:10`) |
+| `metadata.provider_name` | `provider_name` | `node.metadata.provider_name` | 测试数据 (`embed-renderer.test.js:13`) |
+
+**oEmbed E2E 测试响应** (`ghost/core/test/e2e-api/admin/oembed.test.js:44-61`)
+
+YouTube oEmbed API mock 响应：
+```javascript
+{
+    html: '<iframe width="480" height="270" src="https://www.youtube.com/embed/E5yFcdPAGv0">...</iframe>',
+    thumbnail_url: 'https://i.ytimg.com/vi/E5yFcdPAGv0/hqdefault.jpg',
+    thumbnail_width: 480,
+    thumbnail_height: 360,
+    title: 'Gorillaz - Humility (Official Video)',
+    author_name: 'Gorillaz',
+    provider_name: 'YouTube',
+    type: 'video',
+    // ...
+}
+```
+
+**映射后的 Lexical 节点**（推断）：
+```javascript
+{
+    type: 'embed',
+    version: 1,
+    url: 'https://www.youtube.com/watch?v=E5yFcdPAGv0',
+    embedType: 'video',  // ← type → embedType
+    html: '<iframe>...</iframe>',  // ← html → html
+    metadata: {
+        thumbnail_url: 'https://i.ytimg.com/vi/E5yFcdPAGv0/hqdefault.jpg',  // ← 其他字段打包到 metadata
+        thumbnail_width: 480,
+        thumbnail_height: 360,
+        title: 'Gorillaz - Humility (Official Video)',
+        author_name: 'Gorillaz',
+        provider_name: 'YouTube',
+        // ...
+    },
+    caption: ''
+}
+```
+
+**Twitter 专用渲染器读取路径** (`ghost/core/core/server/services/koenig/node-renderers/embed/types/twitter.js:12-22`)
+
+```javascript
+const metadata = node.metadata;
+const tweetData = metadata && metadata.tweet_data;  // ← 从 metadata 读取 tweet_data
+
+if (tweetData && isEmail) {
+    const tweetId = tweetData.id;  // ← tweet_data.id
+    const authorUser = tweetData.users && tweetData.users.find(user => user.id === tweetData.author_id);  // ← 注意：这里读的是 tweetData.users，不是 tweetData.includes.users
+    const retweetCount = numberFormatter.format(tweetData.public_metrics.retweet_count);  // ← tweet_data.public_metrics
+    const likeCount = numberFormatter.format(tweetData.public_metrics.like_count);
+    // ...
+}
+```
+
+**注意**：渲染器中读取 `tweetData.users`，但根据 Twitter Provider 代码，`includes` 被设置为 `tweet_data.includes`。这意味着：
+- 要么 `@tryghost/koenig-lexical` 在映射时将 `tweet_data.includes.users` 提升到 `tweet_data.users`
+- 要么渲染器代码存在潜在问题
+
+##### 五、字段映射关系图（修正版）
+
+```
+Twitter API v2 响应
+├─→ body.data ──┐
+│               ├─→ oembedData.tweet_data = body.data
+│               │       ├─→ .id
+│               │       ├─→ .text
+│               │       ├─→ .public_metrics
+│               │       └─→ .author_id
+│               │
+├─→ body.includes ──┐
+│                   ├─→ oembedData.tweet_data.includes = body.includes
+│                   │       ├─→ .users[]
+│                   │       └─→ .media[]
+│                   │
+└───────────────────┘
+
+@extractus/oembed-extractor 响应 (publish.twitter.com/oembed)
+├─→ oembedData.html ──→ node.html
+├─→ oembedData.type ──→ node.embedType
+├─→ oembedData.title ──┐
+├─→ oembedData.author_name ──┐
+├─→ oembedData.provider_name ──┤
+└─→ oembedData.tweet_data ──┴──→ node.metadata.*
+
+最终 Lexical embed 节点结构：
+{
+    type: 'embed',
+    version: 1,
+    url: 'https://twitter.com/...',
+    embedType: 'twitter',  // ← oembedData.type
+    html: '<blockquote>...</blockquote>',  // ← oembedData.html
+    metadata: {
+        title: '...',
+        author_name: '...',
+        provider_name: 'Twitter',
+        tweet_data: {  // ← oembedData.tweet_data
+            id: '...',
+            text: '...',
+            public_metrics: {...},
+            includes: {
+                users: [...],
+                media: [...]
+            }
+        }
+    },
+    caption: ''
+}
+```
+
 ### 5.4 外部媒体内联
 
 **服务**: `ghost/core/core/server/services/media-inliner/external-media-inliner.js`
