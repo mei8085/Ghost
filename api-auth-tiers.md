@@ -11,12 +11,14 @@ Ghost 提供 **两套独立的 Web 应用**（Backend 和 Frontend），分别�
 
 ### 接口分类
 
-| 接口类型 | URL 前缀 | 挂载位置 | 目标用户 | 主要功能 |
-|---------|---------|---------|---------|---------|
-| 公开内容接口 (Content API) | `/ghost/api/content/*` | `backend.js` → `api/app.js` | 网站访客、前端应用 | 只读访问公开内容 |
-| 后台管理接口 (Admin API) | `/ghost/api/admin/*` | `backend.js` → `api/app.js` | 管理员、集成应用 | 完整 CRUD 管理 |
-| 会员私域接口 (Members App) | `/members/*` | `frontend.js` | 订阅会员 | 会员登录、订阅管理、评论 |
-| 会员内容门控 | 集成于 Content API | `backend.js` | 认证会员 | 访问付费/会员专属内容 |
+| 接口类型 | URL 前缀 | 挂载位置 | 目标用户 | 凭证要求 | 主要功能 |
+|---------|---------|---------|---------|---------|---------|
+| 公开内容接口 (Content API) | `/ghost/api/content/*` | `backend.js` → `api/app.js` | 集成应用、认证会员 | **需要 Content API Key 或 GhostMembers Token 之一** | 只读访问公开内容（带凭证的访问） |
+| 后台管理接口 (Admin API) | `/ghost/api/admin/*` | `backend.js` → `api/app.js` | 管理员、集成应用 | 需要 Admin JWT 或 Session | 完整 CRUD 管理 |
+| 会员私域接口 (Members App) | `/members/*` | `frontend.js` | 订阅会员 | 需要 Session 或 UUID+HMAC | 会员登录、订阅管理、评论 |
+| 会员内容门控 | 集成于 Content API | `backend.js` | 认证会员 | 需要 GhostMembers Token（用于身份判断） | 访问付费/会员专属内容 |
+
+**Content API 重要说明**：`authorizeContentApi` 严格要求 `req.api_key` 或 `req.member` 之一存在，两者都没有时直接返回 403。完全无凭证的请求无法通过授权层。
 
 本报告详细分析这几套接口在**凭证类型**、**路由机制**、**权限控制**和**响应裁剪**四个维度的差异。
 
@@ -457,7 +459,7 @@ boot.js (入口挂载)
     ├─→ Backend App (backend.js)
     │       ├─→ /ghost/api/* → API 父应用 (api/app.js)
     │       │       ├─→ /ghost/api/content/* → Content API
-    │       │       │       └─ 认证: Content API Key 或 GhostMembers Token
+    │       │       │       └─ 认证: **必须提供 Content API Key 或 GhostMembers Token 之一，否则 403**
     │       │       │
     │       │       └─→ /ghost/api/admin/* → Admin API
     │       │               ├─ authAdminApi          (JWT Header 或 Session)
