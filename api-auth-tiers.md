@@ -272,8 +272,10 @@ return jwt({
 **特点**:
 - 使用非对称加密 (RSA)，安全性高
 - Token 包含完整会员身份信息（状态、订阅层级等）
-- `credentialsRequired: false` 意味着未登录用户也可以访问，但不会获得 `req.member`
+- `credentialsRequired: false` 表示**未提供 token 时不报错**（不直接 401），但最终是否通过由 `authorizeContentApi` 决定
 - **可用于内容门控判断**，决定是否返回付费内容
+
+**重要注意**：`credentialsRequired: false` 仅表示 JWT 中间件本身不强制要求 token，**Content API 授权层 (`authorizeContentApi`) 仍然要求 `req.api_key` 或 `req.member` 之一存在，否则返回 403**。
 
 #### 3.1.2 Content API Key vs GhostMembers Token 对比
 
