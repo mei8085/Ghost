@@ -2,35 +2,219 @@
 
 ## 1. 概述
 
-Ghost 提供 **四套对外接口**，分别服务于不同的用户场景：
+Ghost 提供 **两套独立的 Web 应用**（Backend 和 Frontend），分别挂载不同的接口：
 
-| 接口类型 | URL 前缀 | 目标用户 | 主要功能 |
-|---------|---------|---------|---------|
-| 公开内容接口 (Content API) | `/ghost/api/content/*` | 网站访客、前端应用 | 只读访问公开内容 |
-| 会员私域接口 (Members App) | `/members/*` | 订阅会员 | 会员登录、订阅管理、评论 |
-| 后台管理接口 (Admin API) | `/ghost/api/admin/*` | 管理员、集成应用 | 完整 CRUD 管理 |
-| 会员内容门控 (集成于 Content API) | 同 Content API | 认证会员 | 访问付费/会员专属内容 |
+| Web 应用 | 挂载位置 | 包含的接口 | 目标用户 |
+|---------|---------|-----------|---------|
+| **Backend App** | `backend.js` | Content API、Admin API、Admin UI | 管理员、集成应用、API 调用者 |
+| **Frontend App** | `frontend.js` | Members App、Webmentions、Gift Preview、主题路由 | 网站访客、订阅会员 |
+
+### 接口分类
+
+| 接口类型 | URL 前缀 | 挂载位置 | 目标用户 | 主要功能 |
+|---------|---------|---------|---------|---------|
+| 公开内容接口 (Content API) | `/ghost/api/content/*` | `backend.js` → `api/app.js` | 网站访客、前端应用 | 只读访问公开内容 |
+| 后台管理接口 (Admin API) | `/ghost/api/admin/*` | `backend.js` → `api/app.js` | 管理员、集成应用 | 完整 CRUD 管理 |
+| 会员私域接口 (Members App) | `/members/*` | `frontend.js` | 订阅会员 | 会员登录、订阅管理、评论 |
+| 会员内容门控 | 集成于 Content API | `backend.js` | 认证会员 | 访问付费/会员专属内容 |
 
 本报告详细分析这几套接口在**凭证类型**、**路由机制**、**权限控制**和**响应裁剪**四个维度的差异。
 
 ---
 
-## 2. 凭证类型对比
+## 2. 请求入口拓扑（基于源码）
 
-### 2.1 Content API 凭证体系
+### 2.1 完整入口链
+
+Ghost 的 HTTP 请求经过三层入口应用：
+
+```
+                    ┌─────────────────┐
+                    │   boot.js       │
+                    │  (入口挂载点)    │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+    ┌─────────▼─────────┐         ┌─────────▼─────────┐
+    │   backend.js      │         │   frontend.js     │
+    │  (后台应用)        │         │  (前台应用)        │
+    └─────────┬─────────┘         └─────────┬─────────┘
+              │                             │
+    ┌─────────▼─────────┐         ┌─────────┼─────────────────┐
+    │   api/app.js      │         │         │                 │
+    │  (API 父应用)      │         │         │                 │
+    └─────────┬─────────┘         │         │                 │
+              │                   │         │                 │
+     ┌────────┴────────┐    ┌─────▼─────┐  ┌▼────────┐  ┌────▼─────┐
+     │                 │    │  members  │  │webmentions│ │  gift    │
+     ▼                 ▼    │   App     │  │           │ │ Preview │
+┌─────────┐       ┌─────────┐└───────────┘  └───────────┘ └──────────┘
+│ Content │       │ Admin   │
+│  API    │       │  API    │
+└─────────┘       └─────────┘
+```
+
+### 2.2 源码挂载链详解
+
+#### 第一层: boot.js（入口挂载）
+
+**文件**: `ghost/core/core/boot.js:240-257`
+
+```javascript
+// ADMIN + API
+const backendApp = require('./server/web/parent/backend')();
+parentApp.use(vhost(config.getBackendMountPath(), backendApp));
+
+// SITE + MEMBERS
+const frontendApp = require('./server/web/parent/frontend')({urlService});
+parentApp.use(vhost(config.getFrontendMountPath(), frontendApp));
+```
+
+**关键点**:
+- `backendApp` 挂载到后台域名/路径
+- `frontendApp` 挂载到前台域名/路径
+- 使用 `vhost` 中间件实现虚拟主机分离
+
+#### 第二层: backend.js（后台应用）
+
+**文件**: `ghost/core/core/server/web/parent/backend.js:9-20`
+
+```javascript
+const {BASE_API_PATH} = require('../../../shared/url-utils');  // BASE_API_PATH = '/ghost/api'
+
+module.exports = () => {
+    const backendApp = express('backend');
+
+    // 挂载 API 父应用
+    backendApp.lazyUse(BASE_API_PATH, require('../api'));  // /ghost/api/* → api/app.js
+    
+    // 挂载 Admin UI
+    backendApp.use('/ghost/.well-known', require('../well-known'));
+    backendApp.use('/ghost', require('../../services/auth/session').createSessionFromToken(), require('../admin')());
+
+    return backendApp;
+};
+```
+
+**backend.js 挂载的内容**:
+| 路径 | 目标应用 | 用途 |
+|-----|---------|------|
+| `/ghost/api/*` | `../api` (api/app.js) | Content API + Admin API |
+| `/ghost/.well-known` | `../well-known` | 公开发现端点 |
+| `/ghost/*` | `../admin` | Admin 管理后台 UI |
+
+#### 第三层: api/app.js（API 父应用）
+
+**文件**: `ghost/core/core/server/web/api/app.js:12-35`
+
+```javascript
+module.exports = function setupApiApp() {
+    const apiApp = express('api');
+
+    // API 版本兼容处理
+    apiApp.use(APIVersionCompatibilityService.versionRewrites);
+    apiApp.use(APIVersionCompatibilityService.contentVersion);
+
+    // 分发给子 API
+    apiApp.lazyUse('/content/', require('./endpoints/content/app'));  // /ghost/api/content/*
+    apiApp.lazyUse('/admin/', require('./endpoints/admin/app'));      // /ghost/api/admin/*
+
+    return apiApp;
+};
+```
+
+**api/app.js 挂载的内容**:
+| 路径 | 目标应用 | 用途 |
+|-----|---------|------|
+| `/ghost/api/content/*` | `./endpoints/content/app` | 公开内容 API |
+| `/ghost/api/admin/*` | `./endpoints/admin/app` | 后台管理 API |
+
+#### 第二层: frontend.js（前台应用）
+
+**文件**: `ghost/core/core/server/web/parent/frontend.js:10-25`
+
+```javascript
+module.exports = (routerConfig) => {
+    const frontendApp = express('frontend');
+
+    // SSL 重定向
+    frontendApp.use(shared.middleware.urlRedirects.frontendSSLRedirect);
+
+    // 挂载 Members App (关键: /members 挂载在 frontend.js，不是 backend.js)
+    frontendApp.lazyUse('/members', require('../members'));
+    
+    // 挂载其他前台服务
+    frontendApp.lazyUse('/webmentions', require('../webmentions'));
+    frontendApp.lazyUse('/gift', require('../gift-preview'));
+    
+    // 挂载主题路由
+    frontendApp.use('/', require('../../../frontend/web')(routerConfig));
+
+    return frontendApp;
+};
+```
+
+**frontend.js 挂载的内容**:
+| 路径 | 目标应用 | 用途 |
+|-----|---------|------|
+| `/members/*` | `../members` | 会员门户（登录、订阅、评论等） |
+| `/webmentions/*` | `../webmentions` | Webmention 接收 |
+| `/gift/*` | `../gift-preview` | 礼物卡预览 |
+| `/*` | `../../../frontend/web` | 主题渲染、博客页面 |
+
+### 2.3 修正后的路由拓扑总结
+
+```
+HTTP 请求
+    ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                     boot.js (入口挂载)                           │
+│  ┌─────────────────────────┐    ┌─────────────────────────┐    │
+│  │ backend.js (后台应用)     │    │ frontend.js (前台应用)    │    │
+│  │ 路径: /ghost/*           │    │ 路径: /members/*         │    │
+│  │       /ghost/api/*       │    │       /webmentions/*     │    │
+│  │                         │    │       /gift/*            │    │
+│  │                         │    │       /* (主题路由)       │    │
+│  └──────────┬──────────────┘    └──────────┬──────────────┘    │
+└─────────────┼──────────────────────────────┼───────────────────┘
+              │                              │
+              ▼                              ▼
+┌─────────────────────────┐       ┌─────────────────────────┐
+│ api/app.js (API 父应用)  │       │ members/app.js          │
+│ 路径: /ghost/api/*      │       │ 路径: /members/*        │
+└──────────┬──────────────┘       │ 认证: Session Cookie    │
+           │                      │       UUID + HMAC       │
+           │                      └─────────────────────────┘
+    ┌──────┴──────┐
+    ▼             ▼
+┌─────────┐ ┌─────────┐
+│ Content │ │ Admin   │
+│  API    │ │  API    │
+└─────────┘ └─────────┘
+```
+
+**关键修正**:
+- ❌ **错误**: `/members/*` 挂在 `backend.js`
+- ✅ **正确**: `/members/*` 挂在 `frontend.js`
+- ❌ **错误**: `/ghost/api/*` 和 `/members/*` 同属一个应用
+- ✅ **正确**: 分属 `backend.js` 和 `frontend.js` 两个独立应用
+
+---
+
+## 3. 凭证类型对比
+
+### 3.1 Backend App 凭证体系（Content API + Admin API）
+
+#### 3.1.1 Content API 凭证
 
 Content API 支持 **两种独立的认证方式**，任一通过即可：
 
-#### 方式一: Content API Key（集成凭证）
+**方式一: Content API Key（集成凭证）**
 
 - **位置**: URL 查询参数 `?key={content_api_key}`
 - **认证位置**: `ghost/core/core/server/services/auth/api-key/content.js:12`
-- **认证流程**:
-  1. 从 `req.query.key` 提取密钥
-  2. 验证密钥是否存在于数据库
-  3. 检查密钥类型是否为 `'content'`
-  4. 检查集成限制 (customIntegrations 限制)
-  5. 成功后将密钥对象存储在 `req.api_key`
+- **挂载位置**: `backend.js` → `api/app.js` → `content/app.js`
 
 ```javascript
 // 关键代码位置: content.js:28-42
@@ -57,15 +241,11 @@ if (apiKey.get('type') !== 'content') {
 - 适用于 **第三方集成** 访问公开内容
 - **不提供会员身份**，无法访问付费内容
 
-#### 方式二: GhostMembers JWT Token（会员凭证）
+**方式二: GhostMembers JWT Token（会员凭证）**
 
 - **位置**: HTTP Header `Authorization: GhostMembers {jwt_token}`
 - **认证位置**: `ghost/core/core/server/services/auth/members/index.js:8`
-- **认证流程**:
-  1. 从 Authorization 头提取 JWT (scheme 必须为 `GhostMembers`)
-  2. 使用 **RS512** 非对称算法验证签名
-  3. 验证 audience (站点源 URL) 和 issuer
-  4. 成功后将会员信息存储在 `req.member`
+- **挂载位置**: 虽由 Members App 签发，但用于 Content API 认证
 
 ```javascript
 // 关键代码位置: members/index.js:13-33
@@ -95,7 +275,7 @@ return jwt({
 - `credentialsRequired: false` 意味着未登录用户也可以访问，但不会获得 `req.member`
 - **可用于内容门控判断**，决定是否返回付费内容
 
-### 2.2 Content API Key vs GhostMembers Token 对比
+#### 3.1.2 Content API Key vs GhostMembers Token 对比
 
 | 对比项 | Content API Key | GhostMembers Token |
 |-------|----------------|-------------------|
@@ -106,16 +286,106 @@ return jwt({
 | **付费内容访问** | ❌ 不能（无会员身份） | ✅ 可用于内容门控判断 |
 | **适用场景** | 前端应用、静态站点生成器 | 会员登录状态、付费内容访问 |
 | **过期机制** | 永久有效（可手动撤销） | 短期有效（JWT 过期时间） |
+| **签发来源** | Ghost Admin 集成页面 | Members App (`/members/api/session`) |
 
-### 2.3 会员私域接口 (Members App) 凭证
+#### 3.1.3 Admin API 凭证
 
-Members App 是一个**独立的应用**，使用自己的认证中间件：
+Admin API 支持 **三种认证方式**：
+
+**方式一: Admin JWT Token (Header)**
+
+- **位置**: HTTP Header `Authorization: Ghost {jwt_token}`
+- **认证位置**: `ghost/core/core/server/services/auth/api-key/admin.js:48`
+- **挂载位置**: `backend.js` → `api/app.js` → `admin/app.js`
+
+**JWT 特殊要求**:
+- 必须包含 `kid` (Key ID) 头部，用于查找对应的 API Key
+- 必须包含 `audience` 声明，匹配请求的 API 路径
+- 使用 **HS256** 对称算法，密钥为 API Key 的 secret
+- 默认有效期 **5 分钟**
+
+```javascript
+// 关键代码位置: admin.js:104-179
+const authenticateWithToken = async function apiKeyAuthenticateWithToken(originalUrl, token, ignoreMaxAge) {
+    const decoded = jwt.decode(token, {complete: true});
+    const apiKeyId = decoded.header.kid;
+    
+    // 1. 通过 kid 查找 API Key
+    const apiKey = await models.ApiKey.findOne({id: apiKeyId}, {withRelated: ['integration']});
+    
+    // 2. 验证类型为 'admin'
+    if (apiKey.get('type') !== 'admin') {
+        throw new errors.UnauthorizedError({...});
+    }
+    
+    // 3. 验证 JWT 签名和 audience
+    jwt.verify(token, secret, options);
+    
+    // 4. 如果是 staff token (有 user_id)，获取关联用户
+    if (apiKey.get('user_id')) {
+        const user = await models.User.findOne({id: apiKey.get('user_id'), status: 'active'}, {require: true});
+        result.user = user;
+    }
+};
+```
+
+**方式二: Admin JWT Token (URL) - authAdminApiWithUrl**
+
+- **位置**: URL 查询参数 `?token={jwt_token}`
+- **认证位置**: `ghost/core/core/server/services/auth/api-key/admin.js:67`
+- **用途**: 定时任务发布、礼物提醒等后台任务
+- **特殊**: 可忽略 token 有效期 (`ignoreMaxAge: true`)
+
+```javascript
+// 关键代码位置: admin.js:67-77
+const authenticateWithUrl = function apiKeyAuthenticateWithUrl(req, res, next) {
+    const token = _extractTokenFromUrl(req.originalUrl);
+    // CASE: Scheduler publish URLs can have long maxAge but controlled by expiry and neverBefore
+    return wrappedAuthenticateWithToken(req, res, next, {token, ignoreMaxAge: true});
+};
+```
+
+**方式三: Session Cookie（浏览器登录）**
+
+- **位置**: Cookie + Session
+- **认证位置**: `ghost/core/core/server/services/auth/session/middleware.js:42`
+
+```javascript
+// 关键代码位置: session/middleware.js:42-59
+async function authenticate(req, res, next) {
+    try {
+        const user = await sessionService.getUserForSession(req, res);
+        if (user) {
+            const isVerified = await sessionService.isVerifiedSession(req, res);
+            if (!isVerified) {
+                return next();
+            }
+            req.user = user;
+        }
+        next();
+    } catch (err) {
+        next(err);
+    }
+}
+```
+
+**Admin Token 类型细分**:
+
+| Token 类型 | 是否有 user_id | 权限模型 |
+|-----------|---------------|---------|
+| **Staff Token** | ✅ 有 | 继承关联用户的权限 |
+| **Integration Token** | ❌ 无 | 受 endpoint 白名单限制 |
+
+### 3.2 Frontend App 凭证体系（Members App）
+
+Members App 是一个**独立的 Express 应用**，挂在 `frontend.js`，使用自己的认证中间件：
 
 **凭证类型一: Session Cookie（浏览器登录）**
 
 - **位置**: Cookie (`ghost-members-ssr` 等)
 - **认证中间件**: `loadMemberSession`
 - **认证位置**: `ghost/core/core/server/services/members/middleware.js:91`
+- **挂载位置**: `frontend.js` → `members/app.js`
 
 ```javascript
 // 关键代码位置: middleware.js:91-101
@@ -154,121 +424,60 @@ const authMemberByUuid = async function authMemberByUuid(req, res, next) {
 };
 ```
 
-### 2.4 后台管理接口 (Admin API) 凭证
+**凭证类型三: Magic Link Token**
 
-Admin API 支持 **三种认证方式**：
+- **位置**: URL 查询参数 `?token=`
+- **认证中间件**: `createSessionFromMagicLink`
+- **用途**: 免密登录链接
 
-#### 方式一: Admin JWT Token (Header)
+### 3.3 凭证与挂载位置对照表
 
-- **位置**: HTTP Header `Authorization: Ghost {jwt_token}`
-- **认证位置**: `ghost/core/core/server/services/auth/api-key/admin.js:48`
-
-**JWT 特殊要求**:
-- 必须包含 `kid` (Key ID) 头部，用于查找对应的 API Key
-- 必须包含 `audience` 声明，匹配请求的 API 路径
-- 使用 **HS256** 对称算法，密钥为 API Key 的 secret
-- 默认有效期 **5 分钟**
-
-```javascript
-// 关键代码位置: admin.js:104-179
-const authenticateWithToken = async function apiKeyAuthenticateWithToken(originalUrl, token, ignoreMaxAge) {
-    const decoded = jwt.decode(token, {complete: true});
-    const apiKeyId = decoded.header.kid;
-    
-    // 1. 通过 kid 查找 API Key
-    const apiKey = await models.ApiKey.findOne({id: apiKeyId}, {withRelated: ['integration']});
-    
-    // 2. 验证类型为 'admin'
-    if (apiKey.get('type') !== 'admin') {
-        throw new errors.UnauthorizedError({...});
-    }
-    
-    // 3. 验证 JWT 签名和 audience
-    jwt.verify(token, secret, options);
-    
-    // 4. 如果是 staff token (有 user_id)，获取关联用户
-    if (apiKey.get('user_id')) {
-        const user = await models.User.findOne({id: apiKey.get('user_id'), status: 'active'}, {require: true});
-        result.user = user;
-    }
-};
-```
-
-#### 方式二: Admin JWT Token (URL) - authAdminApiWithUrl
-
-- **位置**: URL 查询参数 `?token={jwt_token}`
-- **认证位置**: `ghost/core/core/server/services/auth/api-key/admin.js:67`
-- **用途**: 定时任务发布、礼物提醒等后台任务
-- **特殊**: 可忽略 token 有效期 (`ignoreMaxAge: true`)
-
-```javascript
-// 关键代码位置: admin.js:67-77
-const authenticateWithUrl = function apiKeyAuthenticateWithUrl(req, res, next) {
-    const token = _extractTokenFromUrl(req.originalUrl);
-    // CASE: Scheduler publish URLs can have long maxAge but controlled by expiry and neverBefore
-    return wrappedAuthenticateWithToken(req, res, next, {token, ignoreMaxAge: true});
-};
-```
-
-#### 方式三: Session Cookie（浏览器登录）
-
-- **位置**: Cookie + Session
-- **认证位置**: `ghost/core/core/server/services/auth/session/middleware.js:42`
-
-```javascript
-// 关键代码位置: session/middleware.js:42-59
-async function authenticate(req, res, next) {
-    try {
-        const user = await sessionService.getUserForSession(req, res);
-        if (user) {
-            const isVerified = await sessionService.isVerifiedSession(req, res);
-            if (!isVerified) {
-                return next();
-            }
-            req.user = user;
-        }
-        next();
-    } catch (err) {
-        next(err);
-    }
-}
-```
-
-**Admin Token 类型细分**:
-
-| Token 类型 | 是否有 user_id | 权限模型 |
-|-----------|---------------|---------|
-| **Staff Token** | ✅ 有 | 继承关联用户的权限 |
-| **Integration Token** | ❌ 无 | 受 endpoint 白名单限制 |
+| 凭证类型 | 挂载应用 | 入口文件 | 目标接口 |
+|---------|---------|---------|---------|
+| Content API Key | Backend App | `backend.js` → `api/app.js` | Content API |
+| GhostMembers JWT | Backend App | `backend.js` → `api/app.js` | Content API (内容门控) |
+| Admin JWT (Header) | Backend App | `backend.js` → `api/app.js` | Admin API |
+| Admin JWT (URL) | Backend App | `backend.js` → `api/app.js` | Admin API (定时任务) |
+| Admin Session | Backend App | `backend.js` | Admin UI + Admin API |
+| Members Session | Frontend App | `frontend.js` | Members App |
+| Members UUID+HMAC | Frontend App | `frontend.js` | Members App (邮件链接) |
 
 ---
 
-## 3. 请求路由与权限层
+## 4. 请求路由与权限层
 
-### 3.1 整体路由结构
-
-请求首先通过 Web 入口层路由到不同的应用：
+### 4.1 修正后的整体路由结构
 
 ```
 HTTP 请求
     ↓
-Web 入口路由 (backend.js)
-    ├─→ /ghost/api/content/* → Content API 应用
-    │       └─ 支持 Content API Key 或 GhostMembers Token
+boot.js (入口挂载)
+    ├─→ Backend App (backend.js)
+    │       ├─→ /ghost/api/* → API 父应用 (api/app.js)
+    │       │       ├─→ /ghost/api/content/* → Content API
+    │       │       │       └─ 认证: Content API Key 或 GhostMembers Token
+    │       │       │
+    │       │       └─→ /ghost/api/admin/* → Admin API
+    │       │               ├─ authAdminApi          (JWT Header 或 Session)
+    │       │               ├─ authAdminApiWithUrl   (URL Token)
+    │       │               └─ publicAdminApi        (无认证，仅 /site)
+    │       │
+    │       └─→ /ghost/* → Admin UI
     │
-    ├─→ /ghost/api/admin/*   → Admin API 应用
-    │       ├─ authAdminApi          (需要认证)
-    │       ├─ authAdminApiWithUrl   (URL Token 认证)
-    │       └─ publicAdminApi        (无需认证)
-    │
-    └─→ /members/*           → Members App (独立门户)
-            ├─ /members/api/*        (会员相关操作)
-            └─ /members/webhooks/*   (Stripe 等 Webhook)
+    └─→ Frontend App (frontend.js)
+            ├─→ /members/* → Members App (独立门户)
+            │       ├─ /members/api/*        (Session 或 UUID+HMAC)
+            │       └─ /members/webhooks/*   (无认证)
+            │
+            ├─→ /webmentions/* → Webmention 接收
+            ├─→ /gift/* → Gift Preview
+            └─→ /* → 主题路由
 ```
 
-### 3.2 Content API 认证链
+### 4.2 Backend App - Content API 认证链
 
 **位置**: `ghost/core/core/server/web/api/endpoints/content/middleware.js:18`
+**挂载链**: `backend.js` → `api/app.js` → `content/app.js` → `content/routes.js`
 
 ```javascript
 module.exports.authenticatePublic = [
@@ -303,9 +512,109 @@ authorizeContentApi(req, res, next) {
 
 **关键点**: Content API 允许 **无认证访问**（当 `credentialsRequired: false` 时），但 `req.member` 为 `null`，内容门控会按访客处理。
 
-### 3.3 Members App 路由与认证
+### 4.3 Backend App - Admin API 认证链（三种变体）
+
+Admin API 提供 **三种认证中间件**，适用于不同场景：
+**挂载链**: `backend.js` → `api/app.js` → `admin/app.js` → `admin/routes.js`
+
+#### 4.3.1 authAdminApi（标准认证）
+
+**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:100`
+
+```javascript
+module.exports.authAdminApi = [
+    auth.authenticate.authenticateAdminApi,        // 1. 认证 (JWT Header 或 Session)
+    auth.authorize.authorizeAdminApi,              // 2. 授权检查
+    apiMw.updateUserLastSeen,                      // 3. 更新用户最后活跃时间
+    apiMw.cors,
+    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
+    shared.middleware.prettyUrls,
+    tokenPermissionCheck                           // 4. Token 权限细粒度检查
+];
+```
+
+**认证层详情** (`authenticate.js:6`):
+```javascript
+authenticateAdminApi: [
+    apiKeyAuth.admin.authenticate,  // 尝试 Admin API Key JWT 认证 → req.api_key + 可能 req.user
+    session.authenticate            // 尝试 Session 认证 → req.user
+]
+```
+
+**授权层详情** (`authorize.js:26-38`):
+```javascript
+authorizeAdminApi(req, res, next) {
+    const hasUser = req.user && req.user.id;        // Session 或 Staff Token
+    const hasApiKey = req.api_key && req.api_key.id; // Integration Token
+    
+    if (hasUser || hasApiKey) {
+        return next();
+    }
+    return next(new errors.NoPermissionError({...}));
+}
+```
+
+#### 4.3.2 authAdminApiWithUrl（URL Token 认证）
+
+**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:116`
+
+```javascript
+module.exports.authAdminApiWithUrl = [
+    auth.authenticate.authenticateAdminApiWithUrl,  // 1. 从 URL ?token= 提取并认证
+    auth.authorize.authorizeAdminApi,               // 2. 授权检查
+    apiMw.updateUserLastSeen,
+    apiMw.cors,
+    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
+    shared.middleware.prettyUrls,
+    tokenPermissionCheck
+];
+```
+
+**使用场景** (`routes.js`):
+```javascript
+// 定时任务发布
+router.put('/schedules/:resource/:id', mw.authAdminApiWithUrl, http(api.schedules.publish));
+
+// 礼物提醒
+router.put('/gifts/flush_reminders', mw.authAdminApiWithUrl, http(api.giftReminders.flushReminders));
+
+// 自动化轮询
+router.put('/automations/poll', mw.authAdminApiWithUrl, http(api.automations.poll));
+```
+
+**特点**:
+- Token 从 URL 查询参数 `?token=` 提取
+- 可忽略 token 有效期（`ignoreMaxAge: true`）
+- 用于服务器间的后台任务调用
+
+#### 4.3.3 publicAdminApi（无需认证）
+
+**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:131`
+
+```javascript
+module.exports.publicAdminApi = [
+    apiMw.cors,
+    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
+    shared.middleware.prettyUrls,
+    tokenPermissionCheck  // 仍然检查，但因为无认证，主要用于完整性
+];
+```
+
+**使用场景** (`routes.js:19`):
+```javascript
+// 站点公开信息（用于检测 Ghost 版本等）
+router.get('/site', mw.publicAdminApi, http(api.site.read));
+```
+
+**特点**:
+- 无认证要求，任何人可访问
+- 仅用于 `/site` 端点，返回公开站点信息
+- 仍然经过 `tokenPermissionCheck`，但因为 `req.api_key` 为 null，不会触发限制
+
+### 4.4 Frontend App - Members App 路由与认证
 
 **位置**: `ghost/core/core/server/web/members/app.js`
+**挂载链**: `frontend.js` → `members/app.js`
 
 Members App 是一个**独立的 Express 应用**，使用自己的路由和中间件体系：
 
@@ -353,111 +662,13 @@ module.exports = function setupMembersApp() {
 
 **Members App 认证中间件对比**:
 
-| 中间件 | 凭证来源 | 用途 |
-|-------|---------|------|
-| `loadMemberSession` | Cookie | 浏览器登录会员的常规操作 |
-| `authMemberByUuid` | URL `?uuid=&key=` | 邮件链接（退订等） |
-| `createSessionFromMagicLink` | URL `?token=` | Magic Link 登录 |
+| 中间件 | 凭证来源 | 用途 | 挂载位置 |
+|-------|---------|------|---------|
+| `loadMemberSession` | Cookie | 浏览器登录会员的常规操作 | `frontend.js` |
+| `authMemberByUuid` | URL `?uuid=&key=` | 邮件链接（退订等） | `frontend.js` |
+| `createSessionFromMagicLink` | URL `?token=` | Magic Link 登录 | `frontend.js` |
 
-### 3.4 Admin API 认证链（三种变体）
-
-Admin API 提供 **三种认证中间件**，适用于不同场景：
-
-#### 3.4.1 authAdminApi（标准认证）
-
-**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:100`
-
-```javascript
-module.exports.authAdminApi = [
-    auth.authenticate.authenticateAdminApi,        // 1. 认证 (JWT Header 或 Session)
-    auth.authorize.authorizeAdminApi,              // 2. 授权检查
-    apiMw.updateUserLastSeen,                      // 3. 更新用户最后活跃时间
-    apiMw.cors,
-    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
-    shared.middleware.prettyUrls,
-    tokenPermissionCheck                           // 4. Token 权限细粒度检查
-];
-```
-
-**认证层详情** (`authenticate.js:6`):
-```javascript
-authenticateAdminApi: [
-    apiKeyAuth.admin.authenticate,  // 尝试 Admin API Key JWT 认证 → req.api_key + 可能 req.user
-    session.authenticate            // 尝试 Session 认证 → req.user
-]
-```
-
-**授权层详情** (`authorize.js:26-38`):
-```javascript
-authorizeAdminApi(req, res, next) {
-    const hasUser = req.user && req.user.id;        // Session 或 Staff Token
-    const hasApiKey = req.api_key && req.api_key.id; // Integration Token
-    
-    if (hasUser || hasApiKey) {
-        return next();
-    }
-    return next(new errors.NoPermissionError({...}));
-}
-```
-
-#### 3.4.2 authAdminApiWithUrl（URL Token 认证）
-
-**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:116`
-
-```javascript
-module.exports.authAdminApiWithUrl = [
-    auth.authenticate.authenticateAdminApiWithUrl,  // 1. 从 URL ?token= 提取并认证
-    auth.authorize.authorizeAdminApi,               // 2. 授权检查
-    apiMw.updateUserLastSeen,
-    apiMw.cors,
-    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
-    shared.middleware.prettyUrls,
-    tokenPermissionCheck
-];
-```
-
-**使用场景** (`routes.js`):
-```javascript
-// 定时任务发布
-router.put('/schedules/:resource/:id', mw.authAdminApiWithUrl, http(api.schedules.publish));
-
-// 礼物提醒
-router.put('/gifts/flush_reminders', mw.authAdminApiWithUrl, http(api.giftReminders.flushReminders));
-
-// 自动化轮询
-router.put('/automations/poll', mw.authAdminApiWithUrl, http(api.automations.poll));
-```
-
-**特点**:
-- Token 从 URL 查询参数 `?token=` 提取
-- 可忽略 token 有效期（`ignoreMaxAge: true`）
-- 用于服务器间的后台任务调用
-
-#### 3.4.3 publicAdminApi（无需认证）
-
-**位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:131`
-
-```javascript
-module.exports.publicAdminApi = [
-    apiMw.cors,
-    shared.middleware.urlRedirects.adminSSLAndHostRedirect,
-    shared.middleware.prettyUrls,
-    tokenPermissionCheck  // 仍然检查，但因为无认证，主要用于完整性
-];
-```
-
-**使用场景** (`routes.js:19`):
-```javascript
-// 站点公开信息（用于检测 Ghost 版本等）
-router.get('/site', mw.publicAdminApi, http(api.site.read));
-```
-
-**特点**:
-- 无认证要求，任何人可访问
-- 仅用于 `/site` 端点，返回公开站点信息
-- 仍然经过 `tokenPermissionCheck`，但因为 `req.api_key` 为 null，不会触发限制
-
-### 3.5 Token 权限细粒度检查
+### 4.5 Admin API Token 权限细粒度检查
 
 **位置**: `ghost/core/core/server/web/api/endpoints/admin/middleware.js:17-91`
 
@@ -517,29 +728,30 @@ const tokenPermissionCheck = function tokenPermissionCheck(req, res, next) {
 
 **Admin 认证方式总结**:
 
-| 认证方式 | 中间件 | 凭证位置 | 适用场景 | 权限范围 |
-|---------|-------|---------|---------|---------|
-| JWT Header | `authAdminApi` | `Authorization: Ghost` | 第三方集成 | Staff Token: 继承用户权限；Integration Token: 白名单限制 |
-| JWT URL | `authAdminApiWithUrl` | `?token=` | 定时任务、后台任务 | 同 JWT Header，但可忽略有效期 |
-| Session | `authAdminApi` | Cookie | 浏览器登录 | 完整用户权限 |
-| 无认证 | `publicAdminApi` | 无 | 公开探测 | 仅 `/site` 端点 |
+| 认证方式 | 中间件 | 凭证位置 | 适用场景 | 权限范围 | 挂载位置 |
+|---------|-------|---------|---------|---------|---------|
+| JWT Header | `authAdminApi` | `Authorization: Ghost` | 第三方集成 | Staff Token: 继承用户权限；Integration Token: 白名单限制 | `backend.js` |
+| JWT URL | `authAdminApiWithUrl` | `?token=` | 定时任务、后台任务 | 同 JWT Header，但可忽略有效期 | `backend.js` |
+| Session | `authAdminApi` | Cookie | 浏览器登录 | 完整用户权限 | `backend.js` |
+| 无认证 | `publicAdminApi` | 无 | 公开探测 | 仅 `/site` 端点 | `backend.js` |
 
 ---
 
-## 4. 响应字段按身份裁剪机制
+## 5. 响应字段按身份裁剪机制
 
 Ghost 使用 **四层机制** 实现响应字段的按身份裁剪：
 
-### 4.1 第一层: API 端点分离
+### 5.1 第一层: API 端点分离
 
 相同的数据通过不同的 Controller 暴露，从源头控制访问范围：
 
-| 数据类型 | Content API | Admin API |
-|---------|------------|----------|
-| Posts | `postsPublic` (只读) | `posts` (完整 CRUD) |
-| Pages | `pagesPublic` (只读) | `pages` (完整 CRUD) |
-| Users | `authorsPublic` (仅公开字段) | `users` (完整信息) |
-| Settings | `publicSettings` (仅公开设置) | `settings` (所有设置) |
+| 数据类型 | Content API (backend.js) | Admin API (backend.js) | Members App (frontend.js) |
+|---------|------------------------|----------------------|--------------------------|
+| Posts | `postsPublic` (只读) | `posts` (完整 CRUD) | 不直接暴露 |
+| Pages | `pagesPublic` (只读) | `pages` (完整 CRUD) | 不直接暴露 |
+| Users | `authorsPublic` (仅公开字段) | `users` (完整信息) | 不直接暴露 |
+| Settings | `publicSettings` (仅公开设置) | `settings` (所有设置) | 不直接暴露 |
+| Member 数据 | 不直接暴露 | `members` (管理员管理) | `/api/member` (会员自助) |
 
 **示例: Content API 路由** (`routes.js:17-18`):
 ```javascript
@@ -555,7 +767,13 @@ router.put('/posts/:id', mw.authAdminApi, http(api.posts.edit));
 router.delete('/posts/:id', mw.authAdminApi, http(api.posts.destroy));
 ```
 
-### 4.2 第二层: 查询过滤限制
+**示例: Members App 路由** (`app.js:53-62`):
+```javascript
+membersApp.get('/api/member', middleware.getMemberData);
+membersApp.put('/api/member', middleware.updateMemberData);
+```
+
+### 5.2 第二层: 查询过滤限制
 
 Content API 在查询层就限制了可过滤的字段：
 
@@ -582,16 +800,17 @@ const ADMIN_API_RESTRICTED_FIELDS = new Set([
 ]);
 ```
 
-| API 类型 | 禁止过滤字段 |
-|---------|-------------|
-| Content API | `password`, `email` |
-| Admin API | `password` |
+| API 类型 | 挂载位置 | 禁止过滤字段 |
+|---------|---------|-------------|
+| Content API | `backend.js` | `password`, `email` |
+| Admin API | `backend.js` | `password` |
+| Members App | `frontend.js` | 自行管理（不使用此机制） |
 
-### 4.3 第三层: 序列化器字段裁剪
+### 5.3 第三层: 序列化器字段裁剪
 
 这是最精细的裁剪层，通过 `mappers` 和 `clean` 工具实现。
 
-#### 4.3.1 Posts 字段裁剪
+#### 5.3.1 Posts 字段裁剪
 
 **位置**: `mappers/posts.js:89-112`
 
@@ -626,7 +845,7 @@ if (localUtils.isContentAPI(frame)) {
 }
 ```
 
-#### 4.3.2 Authors/Users 字段裁剪
+#### 5.3.2 Authors/Users 字段裁剪
 
 **位置**: `clean.js:27-79`
 
@@ -666,9 +885,9 @@ const author = (attrs, frame) => {
 };
 ```
 
-### 4.4 第四层: 会员内容门控 (Content Gating)
+### 5.4 第四层: 会员内容门控 (Content Gating)
 
-这是最智能的裁剪层，根据会员身份决定返回哪些内容。
+这是最智能的裁剪层，根据会员身份决定返回哪些内容。**注意：此机制仅适用于 Content API (backend.js)，Members App (frontend.js) 不使用此机制**。
 
 **位置**: `post-gating.js:84-124`
 
@@ -717,16 +936,16 @@ const forPost = (attrs, frame) => {
 
 **内容可见性级别** (基于 `visibility` 字段):
 
-| visibility 值 | 可见人群 |
-|--------------|---------|
-| `public` | 所有人（访客、免费会员、付费会员） |
-| `members` | 所有会员（免费 + 付费） |
-| `paid` | 仅付费会员 |
-| `tiers` | 特定付费层级会员 |
+| visibility 值 | 可见人群 | 挂载应用 |
+|--------------|---------|---------|
+| `public` | 所有人（访客、免费会员、付费会员） | Content API (backend.js) |
+| `members` | 所有会员（免费 + 付费） | Content API (backend.js) |
+| `paid` | 仅付费会员 | Content API (backend.js) |
+| `tiers` | 特定付费层级会员 | Content API (backend.js) |
 
 ---
 
-## 5. 付费文章在四种身份下的响应对照
+## 6. 付费文章在四种身份下的响应对照
 
 假设存在一篇付费文章，配置如下：
 - `visibility: 'paid'`（仅付费会员可见）
@@ -735,16 +954,16 @@ const forPost = (attrs, frame) => {
 
 下面对比 **访客、免费会员、付费会员、管理员** 四种身份访问同一篇文章的响应差异：
 
-### 5.1 四种身份定义
+### 6.1 四种身份定义
 
-| 身份 | 认证方式 | `req.member` | `req.user` | `req.api_key` |
-|-----|---------|-------------|-----------|--------------|
-| **访客 (Guest)** | 无认证 或 Content API Key | `null` 或 无 | 无 | 可能有 (Content API) |
-| **免费会员 (Free Member)** | GhostMembers JWT 或 Session | `{status: 'free', products: [...]}` | 无 | 无 |
-| **付费会员 (Paid Member)** | GhostMembers JWT 或 Session | `{status: 'paid', products: [...]}` | 无 | 无 |
-| **管理员 (Admin)** | Admin Session 或 Staff Token | 无 | `{role: 'admin', ...}` | 可能有 (Admin API) |
+| 身份 | 认证方式 | `req.member` | `req.user` | `req.api_key` | 挂载应用 |
+|-----|---------|-------------|-----------|--------------|---------|
+| **访客 (Guest)** | 无认证 或 Content API Key | `null` 或 无 | 无 | 可能有 (Content API) | Backend (backend.js) |
+| **免费会员 (Free Member)** | GhostMembers JWT 或 Session | `{status: 'free', products: [...]}` | 无 | 无 | Backend (backend.js) |
+| **付费会员 (Paid Member)** | GhostMembers JWT 或 Session | `{status: 'paid', products: [...]}` | 无 | 无 | Backend (backend.js) |
+| **管理员 (Admin)** | Admin Session 或 Staff Token | 无 | `{role: 'admin', ...}` | 可能有 (Admin API) | Backend (backend.js) |
 
-### 5.2 响应字段详细对照
+### 6.2 响应字段详细对照
 
 | 字段 | 访客 (Guest) | 免费会员 (Free) | 付费会员 (Paid) | 管理员 (Admin) | 说明 |
 |-----|-------------|----------------|----------------|---------------|------|
@@ -765,9 +984,9 @@ const forPost = (attrs, frame) => {
 | **作者 `status`** | ❌ 被移除 | ❌ 被移除 | ❌ 被移除 | ✅ 保留 | 作者账户状态 |
 | **作者 `created_at`** | ❌ 被移除 | ❌ 被移除 | ❌ 被移除 | ✅ 保留 | 作者创建时间 |
 
-### 5.3 响应示例对比
+### 6.3 响应示例对比
 
-#### 访客访问 (Guest)
+#### 访客访问 (Guest) - Backend App (Content API)
 
 ```json
 {
@@ -797,7 +1016,7 @@ const forPost = (attrs, frame) => {
 - `comments: false` - 无权限时不允许评论
 - 作者的敏感字段（email、status、created_at）被移除
 
-#### 免费会员访问 (Free Member)
+#### 免费会员访问 (Free Member) - Backend App (Content API)
 
 ```json
 {
@@ -826,7 +1045,7 @@ const forPost = (attrs, frame) => {
 - `access: false` - 虽然是会员，但不是付费会员
 - 付费内容仍然被裁剪
 
-#### 付费会员访问 (Paid Member)
+#### 付费会员访问 (Paid Member) - Backend App (Content API)
 
 ```json
 {
@@ -856,7 +1075,7 @@ const forPost = (attrs, frame) => {
 - `comments: true` - 允许评论
 - 但 `mobiledoc`、`lexical` 等源码格式仍被移除（Content API 限制）
 
-#### 管理员访问 (Admin API)
+#### 管理员访问 (Admin API) - Backend App (Admin API)
 
 ```json
 {
@@ -895,7 +1114,7 @@ const forPost = (attrs, frame) => {
 - 作者的 `email`、`status`、`created_at` 等敏感字段可见
 - `access` 字段可能不存在或始终为 `true`（Admin API 不进行内容门控）
 
-### 5.4 关键差异总结
+### 6.4 关键差异总结
 
 | 对比维度 | 访客/免费会员 | 付费会员 | 管理员 |
 |---------|-------------|---------|-------|
@@ -914,12 +1133,14 @@ const forPost = (attrs, frame) => {
 
 ---
 
-## 6. 鉴权流程总结
+## 7. 鉴权流程总结
 
-### 6.1 Content API 完整流程
+### 7.1 Content API 完整流程（Backend App）
 
 ```
 访客请求 GET /ghost/api/content/posts/{paid-post}
+    ↓
+boot.js → backend.js → api/app.js → content/app.js
     ↓
 1. 检查 ?key= 参数 (Content API Key)
     ├─ 找到 → 设置 req.api_key (集成身份，无会员信息)
@@ -946,10 +1167,12 @@ const forPost = (attrs, frame) => {
 6. 返回裁剪后的响应
 ```
 
-### 6.2 Members App 会员数据访问流程
+### 7.2 Members App 会员数据访问流程（Frontend App）
 
 ```
 会员请求 GET /members/api/member
+    ↓
+boot.js → frontend.js → members/app.js
     ↓
 1. loadMemberSession 中间件
     ├─ 从 Cookie 读取会话
@@ -964,10 +1187,12 @@ const forPost = (attrs, frame) => {
 3. 返回会员数据
 ```
 
-### 6.3 Admin API (Staff Token) 完整流程
+### 7.3 Admin API (Staff Token) 完整流程（Backend App）
 
 ```
 管理员请求 PUT /ghost/api/admin/posts/{id}
+    ↓
+boot.js → backend.js → api/app.js → admin/app.js
     ↓
 1. 检查 Authorization: Ghost header
     ├─ 提取 JWT，从 kid 查 API Key
@@ -988,10 +1213,12 @@ const forPost = (attrs, frame) => {
 6. 返回完整响应
 ```
 
-### 6.4 authAdminApiWithUrl 定时任务流程
+### 7.4 authAdminApiWithUrl 定时任务流程（Backend App）
 
 ```
 定时任务请求 PUT /ghost/api/admin/schedules/posts/{id}?token={jwt}
+    ↓
+boot.js → backend.js → api/app.js → admin/app.js
     ↓
 1. authenticateAdminApiWithUrl
     ├─ 从 URL ?token= 提取 JWT
@@ -1009,22 +1236,43 @@ const forPost = (attrs, frame) => {
 
 ---
 
-## 7. 关键文件索引
+## 8. 关键文件索引
+
+### 8.1 入口挂载文件
+
+| 功能模块 | 文件路径 | 说明 |
+|---------|---------|------|
+| 入口挂载点 | `ghost/core/core/boot.js:240-257` | 挂载 backendApp 和 frontendApp |
+| Backend 应用入口 | `ghost/core/core/server/web/parent/backend.js` | 挂载 API 和 Admin UI |
+| Frontend 应用入口 | `ghost/core/core/server/web/parent/frontend.js` | 挂载 Members App 和主题路由 |
+| API 父应用 | `ghost/core/core/server/web/api/app.js` | 分发到 Content API 和 Admin API |
+
+### 8.2 认证相关文件
+
+| 功能模块 | 文件路径 | 挂载位置 |
+|---------|---------|---------|
+| Content API Key 认证 | `ghost/core/core/server/services/auth/api-key/content.js` | Backend |
+| Members JWT 认证 | `ghost/core/core/server/services/auth/members/index.js` | Backend (Content API 用) |
+| Admin API Key 认证 | `ghost/core/core/server/services/auth/api-key/admin.js` | Backend |
+| Admin Session 认证 | `ghost/core/core/server/services/auth/session/middleware.js` | Backend |
+| 认证入口编排 | `ghost/core/core/server/services/auth/authenticate.js` | Backend |
+| 授权检查 | `ghost/core/core/server/services/auth/authorize.js` | Backend |
+| Members Session 中间件 | `ghost/core/core/server/services/members/middleware.js` | Frontend |
+
+### 8.3 路由与中间件
+
+| 功能模块 | 文件路径 | 挂载位置 |
+|---------|---------|---------|
+| Members App 入口 | `ghost/core/core/server/web/members/app.js` | Frontend |
+| Content API 中间件 | `ghost/core/core/server/web/api/endpoints/content/middleware.js` | Backend |
+| Admin API 中间件 | `ghost/core/core/server/web/api/endpoints/admin/middleware.js` | Backend |
+| Content API 路由 | `ghost/core/core/server/web/api/endpoints/content/routes.js` | Backend |
+| Admin API 路由 | `ghost/core/core/server/web/api/endpoints/admin/routes.js` | Backend |
+
+### 8.4 响应裁剪文件
 
 | 功能模块 | 文件路径 |
 |---------|---------|
-| Content API Key 认证 | `ghost/core/core/server/services/auth/api-key/content.js` |
-| Members JWT 认证 | `ghost/core/core/server/services/auth/members/index.js` |
-| Admin API Key 认证 | `ghost/core/core/server/services/auth/api-key/admin.js` |
-| Admin Session 认证 | `ghost/core/core/server/services/auth/session/middleware.js` |
-| 认证入口编排 | `ghost/core/core/server/services/auth/authenticate.js` |
-| 授权检查 | `ghost/core/core/server/services/auth/authorize.js` |
-| Members App 入口 | `ghost/core/core/server/web/members/app.js` |
-| Members Session 中间件 | `ghost/core/core/server/services/members/middleware.js` |
-| Content API 中间件 | `ghost/core/core/server/web/api/endpoints/content/middleware.js` |
-| Admin API 中间件 | `ghost/core/core/server/web/api/endpoints/admin/middleware.js` |
-| Content API 路由 | `ghost/core/core/server/web/api/endpoints/content/routes.js` |
-| Admin API 路由 | `ghost/core/core/server/web/api/endpoints/admin/routes.js` |
 | 查询字段限制 | `ghost/core/core/server/api/endpoints/utils/api-filter-utils.ts` |
 | Posts 序列化 | `ghost/core/core/server/api/endpoints/utils/serializers/output/mappers/posts.js` |
 | 字段清理 | `ghost/core/core/server/api/endpoints/utils/serializers/output/utils/clean.js` |
@@ -1032,65 +1280,81 @@ const forPost = (attrs, frame) => {
 
 ---
 
-## 8. 安全要点总结
+## 9. 安全要点总结
 
-### 8.1 凭证分层设计
+### 9.1 入口拓扑修正总结
 
-| 凭证类型 | 安全等级 | 适用场景 | 关键特性 |
-|---------|---------|---------|---------|
-| Content API Key | 低 | 公开集成 | URL 参数，无会员身份 |
-| GhostMembers JWT | 高 | 会员登录 | RSA 非对称，包含会员身份 |
-| Admin JWT (Header) | 最高 | 第三方管理集成 | HS256 + kid + audience，5 分钟有效期 |
-| Admin JWT (URL) | 中 | 定时任务 | 可忽略有效期，仅限内部调用 |
-| Session Cookie | 高 | 浏览器登录 | 完整用户权限，支持 2FA |
+| 之前的错误理解 | 源码中的正确实现 |
+|--------------|----------------|
+| `/members/*` 挂在 `backend.js` | `/members/*` 挂在 `frontend.js` |
+| Content API 和 Members App 同属 backend | Content API → backend.js, Members App → frontend.js |
+| 统一的认证体系 | Backend 和 Frontend 各有独立认证体系 |
 
-### 8.2 路由与权限架构
+### 9.2 凭证分层设计
+
+| 凭证类型 | 安全等级 | 挂载位置 | 适用场景 | 关键特性 |
+|---------|---------|---------|---------|---------|
+| Content API Key | 低 | Backend | 公开集成 | URL 参数，无会员身份 |
+| GhostMembers JWT | 高 | Backend (Content API 用) | 会员登录 | RSA 非对称，包含会员身份 |
+| Admin JWT (Header) | 最高 | Backend | 第三方管理集成 | HS256 + kid + audience，5 分钟有效期 |
+| Admin JWT (URL) | 中 | Backend | 定时任务 | 可忽略有效期，仅限内部调用 |
+| Admin Session | 高 | Backend | 浏览器登录 | 完整用户权限，支持 2FA |
+| Members Session | 高 | Frontend | 会员浏览器操作 | Cookie 会话，独立于 Backend |
+| Members UUID+HMAC | 中 | Frontend | 邮件链接 | HMAC 验证，一次性使用 |
+
+### 9.3 修正后的路由与权限架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Ghost API 架构                          │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  /ghost/api/content/*                                       │
-│  └─ Content API                                             │
-│     ├─ 认证: Content API Key 或 GhostMembers JWT            │
-│     ├─ 授权: 任一通过即可                                    │
-│     └─ 响应: 四层裁剪 (端点→查询→序列化→内容门控)            │
-│                                                             │
-│  /members/*                                                 │
-│  └─ Members App (独立应用)                                   │
-│     ├─ 认证: Session Cookie 或 UUID+HMAC                    │
-│     ├─ 功能: 登录、订阅、评论、反馈                           │
-│     └─ /api/site: 公开探测端点 (无认证)                      │
-│                                                             │
-│  /ghost/api/admin/*                                         │
-│  └─ Admin API                                               │
-│     ├─ authAdminApi: JWT Header 或 Session                  │
-│     │   └─ Staff Token: 继承用户权限                         │
-│     │   └─ Integration Token: 端点白名单限制                 │
-│     ├─ authAdminApiWithUrl: URL Token (定时任务)             │
-│     └─ publicAdminApi: 无认证 (仅 /site)                     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Ghost Web 架构 (修正后)                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    boot.js (入口挂载点)                          │    │
+│  │  ┌──────────────────────────┐    ┌──────────────────────────┐   │    │
+│  │  │    backend.js            │    │    frontend.js           │   │    │
+│  │  │  (后台应用)               │    │  (前台应用)               │   │    │
+│  │  └──────────┬───────────────┘    └──────────┬───────────────┘   │    │
+│  └─────────────┼───────────────────────────────┼────────────────────┘    │
+│                │                               │                         │
+│  ┌─────────────▼─────────────┐     ┌───────────▼───────────────────┐    │
+│  │  /ghost/api/*             │     │  /members/*                   │    │
+│  │  (api/app.js)             │     │  (members/app.js)             │    │
+│  │                           │     │                               │    │
+│  │  ┌─────────┐ ┌─────────┐  │     │  认证:                       │    │
+│  │  │ Content │ │ Admin   │  │     │    • Session Cookie          │    │
+│  │  │  API    │ │  API    │  │     │    • UUID + HMAC             │    │
+│  │  │         │ │         │  │     │    • Magic Link Token        │    │
+│  │  认证:      │ 认证:      │     │                               │    │
+│  │  • API Key │ • JWT     │     │  功能:                         │    │
+│  │  • Members │ • Session │     │    • 登录/登出                 │    │
+│  │    JWT     │ • URL JWT │     │    • 订阅管理                  │    │
+│  │            │ • public  │     │    • 评论                      │    │
+│  │            │           │     │    • 个人资料                  │    │
+│  └───────────┘ └───────────┘     └───────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 字段裁剪四层防护
+### 9.4 字段裁剪四层防护
 
 1. **端点分离**: `postsPublic` vs `posts` - 从源头限制
 2. **查询限制**: 禁止 `password`/`email` 过滤
 3. **序列化清理**: 移除 `status`、`email`、`notification` 设置等
-4. **内容门控**: 根据 `visibility` 和会员身份动态裁剪
+4. **内容门控**: 根据 `visibility` 和会员身份动态裁剪（仅 Content API）
 
-### 8.4 内容门控设计要点
+### 9.5 内容门控设计要点
 
 - **不是简单的 403**: 无权限时返回部分内容 + `access: false`，而非拒绝访问
 - **付费墙标记**: `<!--members-only-->` 支持部分内容可见
 - **精细块级控制**: `<!--kg-gated-block-->` 支持段级别的门控
 - **`access` 字段**: 前端可根据此字段判断是否显示升级提示
+- **仅适用于 Backend**: Members App (frontend.js) 不使用此机制
 
-### 8.5 Admin API 安全边界
+### 9.6 Admin API 安全边界
 
 - **Staff Token vs Integration Token**: Staff Token 继承用户权限，Integration Token 受白名单限制
 - **高风险操作保护**: Staff Token 禁止删除所有内容、转让所有权
 - **端点白名单**: Integration Token 只能访问明确允许的资源和方法
 - **Token 有效期**: 默认 5 分钟，定时任务可例外
+- **仅在 Backend**: Admin API 完全独立于 Frontend 的 Members App
