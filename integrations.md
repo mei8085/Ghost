@@ -322,15 +322,17 @@ apiKey(id) {
    isIntegration = loadedPermissions.apiKey && _.some(loadedPermissions.apiKey.roles, {name: 'Admin Integration'});
    ```
 
-**重要结论**：
-- **多个自定义集成之间不是按资源隔离的**
-- 所有自定义集成的 Admin API Key 都共享 "Admin Integration" 角色的权限边界
-- 任何一个自定义集成都可以：
-  - 读取/修改所有文章、页面、标签
-  - 管理所有成员数据
-  - 修改站点设置
-  - 管理其他集成的 webhook（通过 `webhook: all` 权限）
-- 这是**有意的设计选择**，而非遗漏
+**重要结论（修正前版本）**：
+- ~~任何一个自定义集成都可以：~~
+  - ~~读取/修改所有文章、页面、标签~~
+  - ~~管理所有成员数据~~
+  - ~~修改站点设置~~
+  - ~~管理其他集成的 webhook（通过 `webhook: all` 权限）~~
+
+**修正后的结论**：
+- **多个自定义集成之间不是按资源隔离的**（共享角色权限边界）
+- **但 webhook 有独立的按集成 ID 隔离机制**
+- 详见下文"共享角色权限与 webhook 资源隔离并存"
 
 ### API Key 生成流程
 
@@ -880,33 +882,77 @@ integration_id: {
   - 删除集成时，webhook 回调会立即停止（因为 webhook 记录已被删除）
   - 但 API Key 可能仍然有效（如果没有被显式清理）
 
-#### 权限隔离：共享角色边界
+#### 权限隔离：共享角色边界与 Webhook 资源隔离并存
 
-**关键设计：多个自定义集成共享 "Admin Integration" 角色**
+**关键设计：双重隔离机制**
+
+Ghost 的权限系统存在一个重要的边界：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        "Admin Integration" Role                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Permissions: post:all, member:all, setting:all, ...    │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                          ▲                                      │
-│                          │ belongs_to                           │
-│                          │                                      │
-│    ┌─────────────────────┼─────────────────────┐               │
-│    │                     │                     │               │
-│    ▼                     ▼                     ▼               │
-│  ┌───────┐             ┌───────┐             ┌───────┐         │
-│  │ Key A │             │ Key B │             │ Key C │         │
-│  │(Int A)│             │(Int B)│             │(Int C)│         │
-│  └───┬───┘             └───┬───┘             └───┬───┘         │
-│      │                     │                     │               │
-│      ▼                     ▼                     ▼               │
-│  ┌───────┐             ┌───────┐             ┌───────┐         │
-│  │ Int A │             │ Int B │             │ Int C │         │
-│  │(Custom)│            │(Custom)│            │(Custom)│         │
-│  └───────┘             └───────┘             └───────┘         │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        权限边界双重机制                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 共享角色权限（无资源隔离）                                        │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                     │   │
+│  │     ┌─────────────────────────────────────────────────────┐         │   │
+│  │     │            "Admin Integration" Role                 │         │   │
+│  │     │  webhook: all, post: all, member: all, ...         │         │   │
+│  │     └─────────────────────────────────────────────────────┘         │   │
+│  │                          ▲                                          │   │
+│  │                          │ belongs_to                               │   │
+│  │                          │                                          │   │
+│  │     ┌────────────────────┼────────────────────┐                     │   │
+│  │     │                    │                    │                     │   │
+│  │     ▼                    ▼                    ▼                     │   │
+│  │  ┌───────┐            ┌───────┐            ┌───────┐                 │   │
+│  │  │ Key A │            │ Key B │            │ Key C │                 │   │
+│  │  │(Int A)│            │(Int B)│            │(Int C)│                 │   │
+│  │  └───┬───┘            └───┬───┘            └───┬───┘                 │   │
+│  │      │                    │                    │                     │   │
+│  │      ▼                    ▼                    ▼                     │   │
+│  │  ┌───────┐            ┌───────┐            ┌───────┐                 │   │
+│  │  │ Int A │            │ Int B │            │ Int C │                 │   │
+│  │  └───────┘            └───────┘            └───────┘                 │   │
+│  │                                                                     │   │
+│  │  权限检查逻辑：只检查角色名称，不检查集成 ID                            │   │
+│  │  isIntegration = _.some(roles, {name: 'Admin Integration'})          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  2. Webhook 资源隔离（按 integration_id 强制绑定）                    │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                     │   │
+│  │     集成 A 的 webhook ←───┐                                          │   │
+│  │                           │                                          │   │
+│  │     集成 A 的 Key ────────┼──> 只能操作 integration_id = Int A 的    │   │
+│  │                           │      webhook（通过 API 层权限检查）      │   │
+│  │     集成 B 的 Key ────────┼──> 只能操作 integration_id = Int B 的    │   │
+│  │                           │      webhook                             │   │
+│  │     集成 C 的 Key ────────┘                                          │   │
+│  │                                                                     │   │
+│  │  Webhook 权限检查逻辑：                                               │   │
+│  │  webhook.integration_id === context.integration.id                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**共享角色权限边界** (`ghost/core/core/server/models/api-key.js:39-47`):
+
+```javascript
+onSaving(model, attrs, options) {
+    // enforce roles which are currently hardcoded
+    if (this.get('type') === 'admin') {
+        return Role.findOne(
+            {name: attrs.role || 'Admin Integration'},  // 所有 Admin Key 共享
+            Object.assign({}, options, {columns: ['id']})
+        ).then((role) => {
+            this.set('role_id', role.get('id'));
+        });
+    }
+}
 ```
 
 **权限加载流程** (`ghost/core/core/server/services/permissions/providers.js:58-74`):
@@ -924,11 +970,265 @@ apiKey(id) {
 }
 ```
 
+#### Webhook 三条链路的详细权限判断
+
+##### 链路一：Webhook 新增 (Add)
+
+**完整流程：验证 → 序列化 → 服务层 → 模型层**
+
+**Step 1: 验证器检查** (`ghost/core/core/server/api/endpoints/utils/validators/input/webhooks.js:11-24`)
+
+```javascript
+add(apiConfig, frame) {
+    // 检查条件：context.integration.id 存在 或 数据中包含 integration_id
+    if (!_.get(frame, 'options.context.integration.id') && !_.get(frame.data, 'webhooks[0].integration_id')) {
+        return Promise.reject(new errors.ValidationError({
+            message: tpl(messages.schemaValidationFailed, {key: 'integration_id'}),
+            context: tpl(messages.noIntegrationIdProvidedContext),  // "You may only create webhooks with 'integration_id' when using session authentication."
+            property: 'integration_id'
+        }));
+    }
+
+    return jsonSchema.validate(apiConfig, frame);
+}
+```
+
+**两种认证方式对比**:
+| 认证方式 | `context.integration.id` | 验证行为 |
+|----------|-------------------------|----------|
+| **API Key 认证** | 有值（当前集成 ID） | 跳过 `integration_id` 验证，后续由序列化器自动覆盖 |
+| **Session 认证（Owner）** | 无值 | 必须在请求数据中提供 `integration_id` |
+
+**Step 2: 序列化器强制绑定** (`ghost/core/core/server/api/endpoints/utils/serializers/input/webhooks.js:4-11`)
+
+```javascript
+add(apiConfig, frame) {
+    // 如果当前 context 有 integration.id，强制覆盖请求中的 integration_id
+    if (_.get(frame, 'options.context.integration.id')) {
+        frame.data.webhooks[0].integration_id = frame.options.context.integration.id;
+    }
+}
+```
+
+**关键行为**：
+- 请求数据中的 `integration_id` 会被**强制覆盖**为当前集成的 ID
+- 测试用例验证：`integration_id: 'ignore_me'` 实际写入的是 API Key 所属集成的 ID (`ghost/core/test/legacy/api/admin/webhooks.test.js:24,47`)
+
+**Step 3: 服务层验证** (`ghost/core/core/server/services/webhooks/webhooks-service.js:18-49`)
+
+```javascript
+async add(data, options) {
+    // 检查同一事件+URL 是否已存在
+    const webhook = await this.WebhookModel.getByEventAndTarget(
+        data.webhooks[0].event,
+        data.webhooks[0].target_url,
+        options
+    );
+
+    if (webhook) {
+        throw new ValidationError({message: messages.webhookAlreadyExists});
+    }
+
+    try {
+        const newWebhook = await this.WebhookModel.add(data.webhooks[0], options);
+        return newWebhook;
+    } catch (error) {
+        // 捕获外键约束错误（integration_id 不存在）
+        if (error.errno === 1452 || /FOREIGN KEY constraint failed/.test(error.message)) {
+            throw new ValidationError({
+                message: tpl(messages.nonExistingIntegrationIdProvided.message, {key: 'integration_id'}),
+                context: messages.nonExistingIntegrationIdProvided.context,
+                help: messages.nonExistingIntegrationIdProvided.help
+            });
+        }
+        throw error;
+    }
+}
+```
+
+**Step 4: 模型层写入**
+- 最终写入的 `integration_id` 是序列化器强制绑定后的当前集成 ID
+
+---
+
+##### 链路二：Webhook 编辑 (Edit)
+
+**完整流程：权限检查前钩子 → 验证 → 序列化 → 模型层**
+
+**Step 1: 权限检查前钩子** (`ghost/core/core/server/api/endpoints/webhooks.js:37-65`)
+
+```javascript
+edit: {
+    permissions: {
+        before: async (frame) => {
+            // 只有当 context 中有 integration.id 时才执行此检查
+            if (frame.options.context?.integration?.id) {
+                // 1. 查找目标 webhook
+                const webhook = await models.Webhook.findOne({id: frame.options.id});
+                
+                if (!webhook) {
+                    throw new errors.NotFoundError({
+                        message: tpl(messages.resourceNotFound, {resource: 'Webhook'})
+                    });
+                }
+
+                // 2. 核心检查：webhook 的 integration_id 必须等于当前集成 ID
+                if (webhook.get('integration_id') !== frame.options.context.integration.id) {
+                    throw new errors.NoPermissionError({
+                        message: tpl(messages.noPermissionToEdit.message, {method: 'edit'}),
+                        context: tpl(messages.noPermissionToEdit.context, {method: 'edit'})
+                        // 错误信息："You may only edit webhooks that belong to the authenticated integration. Check the supplied Admin API Key."
+                    });
+                }
+            }
+        }
+    },
+    // ...
+}
+```
+
+**检查逻辑**：
+- 如果 `context.integration.id` 存在（API Key 认证）：必须 `webhook.integration_id === context.integration.id`
+- 如果 `context.integration.id` 不存在（Session 认证）：跳过此检查（Owner 可编辑任意 webhook）
+
+**Step 2: 验证器** (`webhooks.js:26`)
+```javascript
+edit: jsonSchema.validate  // 只做 schema 验证
+```
+
+**Step 3: 序列化器**
+- Webhook edit 没有专门的序列化器，直接使用模型层的可编辑字段
+
+---
+
+##### 链路三：Webhook 删除 (Destroy)
+
+**完整流程：权限检查前钩子 → 模型层删除**
+
+**Step 1: 权限检查前钩子** (`ghost/core/core/server/api/endpoints/webhooks.js:88-127`)
+
+```javascript
+destroy: {
+    permissions: {
+        before: async (frame) => {
+            // 只有当 context 中有 integration.id 时才执行此检查
+            if (frame.options.context?.integration?.id) {
+                // 1. 查找目标 webhook
+                const webhook = await models.Webhook.findOne({id: frame.options.id});
+                
+                if (!webhook) {
+                    throw new errors.NotFoundError({
+                        message: tpl(messages.resourceNotFound, {resource: 'Webhook'})
+                    });
+                }
+
+                // 2. 核心检查：webhook 的 integration_id 必须等于当前集成 ID
+                if (webhook.get('integration_id') !== frame.options.context.integration.id) {
+                    throw new errors.NoPermissionError({
+                        message: tpl(messages.noPermissionToEdit.message, {method: 'destroy'}),
+                        context: tpl(messages.noPermissionToEdit.context, {method: 'destroy'})
+                        // 错误信息："You may only destroy webhooks that belong to the authenticated integration. Check the supplied Admin API Key."
+                    });
+                }
+            }
+        }
+    },
+    // ...
+}
+```
+
+**检查逻辑**：
+- 与 edit 完全相同
+- API Key 认证只能删除自己集成的 webhook
+- Session 认证（Owner）可删除任意 webhook
+
+---
+
+#### 共享角色权限与 Webhook 资源隔离并存的边界说明
+
+**核心边界：API Key 认证 vs Session 认证**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Webhook 权限边界：双重认证机制                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  API Key 认证（通过集成的 Admin Key 调用）                              │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                     │   │
+│  │  context.integration.id = 当前集成 ID                                │   │
+│  │                                                                     │   │
+│  │  Add 链路：                                                          │   │
+│  │    - 验证器：跳过 integration_id 检查（因为有 context.integration）   │   │
+│  │    - 序列化器：强制绑定 integration_id = 当前集成 ID                  │   │
+│  │    - 结果：只能创建属于自己的 webhook                                  │   │
+│  │                                                                     │   │
+│  │  Edit/Destroy 链路：                                                 │   │
+│  │    - 权限前钩子：检查 webhook.integration_id === context.integration.id │   │
+│  │    - 结果：只能编辑/删除自己集成的 webhook                            │   │
+│  │                                                                     │   │
+│  │  错误信息："You may only edit/destroy webhooks that belong to the    │   │
+│  │          authenticated integration. Check the supplied Admin API Key."│   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Session 认证（Owner 登录后调用）                                     │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                     │   │
+│  │  context.integration.id = undefined（没有绑定集成）                   │   │
+│  │                                                                     │   │
+│  │  Add 链路：                                                          │   │
+│  │    - 验证器：要求提供 integration_id                                  │   │
+│  │    - 序列化器：不强制覆盖（因为 context.integration 不存在）          │   │
+│  │    - 结果：可创建属于任意集成的 webhook（只要 integration_id 有效）   │   │
+│  │                                                                     │   │
+│  │  Edit/Destroy 链路：                                                 │   │
+│  │    - 权限前钩子：跳过检查（因为 context.integration 不存在）          │   │
+│  │    - 结果：可编辑/删除任意集成的 webhook                             │   │
+│  │                                                                     │   │
+│  │  验证信息："You may only create webhooks with 'integration_id' when  │   │
+│  │           using session authentication."                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**权限矩阵总结**:
+
+| 操作 | API Key 认证（集成 A） | Session 认证（Owner） |
+|------|---------------------|----------------------|
+| **Add Webhook** | 只能创建属于集成 A 的 webhook（强制绑定） | 可创建属于任意集成的 webhook（需指定 integration_id） |
+| **Edit Webhook** | 只能编辑 `integration_id = A` 的 webhook | 可编辑任意 webhook |
+| **Destroy Webhook** | 只能删除 `integration_id = A` 的 webhook | 可删除任意 webhook |
+| **浏览/读取 Webhook** | 无 browse 端点，但 getAll 触发时按集成类型过滤 | - |
+
+**错误信息定义** (`ghost/core/core/server/api/endpoints/webhooks.js:6-12`)：
+
+```javascript
+const messages = {
+    resourceNotFound: '{resource} not found.',
+    noPermissionToEdit: {
+        message: 'You do not have permission to {method} this webhook.',
+        context: 'You may only {method} webhooks that belong to the authenticated integration. Check the supplied Admin API Key.'
+    }
+};
+```
+
+**结论修正**：
+- ❌ **错误结论**："自定义集成可以管理其他集成的 webhook"
+- ✅ **正确结论**：
+  - 通过 **API Key 认证** 的自定义集成：**只能管理自己集成的 webhook**（按 `integration_id` 强制隔离）
+  - 通过 **Session 认证** 的 Owner：**可以管理任意集成的 webhook**
+  - 这是 **API 层的资源隔离**，与角色权限的 `webhook: all` 并存
+
+#### 共享角色权限边界（其他资源）
+
 **实际影响**:
 
-1. **没有按集成 ID 的资源隔离**:
+1. **没有按集成 ID 的资源隔离（除 Webhook 外）**:
    - 集成 A 的 API Key 可以读取/修改集成 B 创建的文章
-   - 集成 A 的 API Key 可以修改集成 B 的 webhook 配置
+   - 集成 A 的 API Key 可以读取/修改所有成员数据
+   - 集成 A 的 API Key 可以修改站点设置
    - 所有集成共享相同的权限边界
 
 2. **权限检查逻辑** (`ghost/core/core/server/models/post.js:1414`):
@@ -1202,30 +1502,41 @@ Ghost 的自定义集成系统提供了完善的第三方应用接入能力：
 
 1. **API Key 机制**: 支持两种类型（Content/Admin），分别用于只读和管理操作
    
-2. **共享角色权限边界**: 
+2. **共享角色权限边界（非资源隔离）**: 
    - 所有自定义集成的 Admin API Key 共享 "Admin Integration" 角色
-   - **不按集成 ID 进行资源隔离**
+   - **不按集成 ID 进行资源隔离**（除 Webhook 外）
    - 任何自定义集成都可以访问所有文章、成员、设置等资源
    - 内部/核心集成有独立的受限角色
 
-3. **强关联 vs 软关联**:
+3. **共享角色权限与 Webhook 资源隔离并存**:
+   - **角色权限层面**：`webhook: all` 权限允许管理 webhook
+   - **API 层面**：通过 `context.integration.id` 强制绑定，只能管理自己集成的 webhook
+   - **双重机制**：角色权限是能力范围，API 层检查是资源边界
+
+4. **Webhook 三条链路的权限判断**:
+   - **Add 链路**：验证器跳过检查 → 序列化器强制绑定 `integration_id` → 只能创建自己的 webhook
+   - **Edit 链路**：权限前钩子检查 `webhook.integration_id === context.integration.id`
+   - **Destroy 链路**：与 Edit 相同的隔离检查
+   - 所有链路的错误信息都明确提示："You may only {method} webhooks that belong to the authenticated integration. Check the supplied Admin API Key."
+
+5. **强关联 vs 软关联**:
    - **Webhook**: 强关联（`integration_id` 非空 + `cascadeDelete: true`），删除集成时自动级联删除
    - **API Key**: 软关联（`integration_id` 可空），删除集成时不会自动删除
    - API Key 可以独立存在（如内部 API Key）
 
-4. **JWT 认证**: Admin API 使用 JWT 签名请求，密钥不直接传输
+6. **JWT 认证**: Admin API 使用 JWT 签名请求，密钥不直接传输
 
-5. **Webhook 完整协作链**: 
+7. **Webhook 完整协作链**: 
    - 模型写入 → `emitChange()` → 事件总线 → `WebhookTrigger.trigger()` → HTTP POST → 状态回写（`last_triggered_at/status/error`）
    - 支持 30+ 种事件类型，双向通信能力完善
 
-6. **签名验证**: Webhook 支持 HMAC-SHA256 签名，包含时间戳防重放攻击
+8. **签名验证**: Webhook 支持 HMAC-SHA256 签名，包含时间戳防重放攻击
 
-7. **凭证轮换**: 
+9. **凭证轮换**: 
    - 支持 API Key 原地替换（生成新 secret）
    - 记录 `refreshed` 审计日志
    - 轮换后旧密钥立即失效，无过渡期
 
-8. **安全防护**: SSRF 防护、内部 IP 限制、超时和重试机制
+10. **安全防护**: SSRF 防护、内部 IP 限制、超时和重试机制
 
-该设计遵循了现代 API 安全最佳实践，同时保持了良好的扩展性和易用性。
+该设计遵循了现代 API 安全最佳实践，同时通过"共享角色权限 + API 层资源隔离"的双重机制实现了 webhook 的精细控制。
